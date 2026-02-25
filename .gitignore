@@ -1,0 +1,29 @@
+# WAL/SHM files (transient SQLite state)
+bible.db-wal
+bible.db-shm
+
+# Backup of previous import attempt
+_backup/
+
+# Source PDF (large binary)
+*.pdf
+
+# Intermediate/source files not needed in repo
+sagrada-biblia-clean.md
+straubinger-v28-clean.md
+*.epub
+
+# Downloaded data
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
