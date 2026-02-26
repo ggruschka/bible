@@ -228,7 +228,7 @@ CREATE TABLE IF NOT EXISTS topic_verse (
 
 CREATE INDEX IF NOT EXISTS idx_topic_verse_addr ON topic_verse(book_id, chapter_number, verse_number);
 
--- ─── Embedding Tables ───
+-- ─── Embedding Tables (context-aware, late-chunked) ───
 
 CREATE TABLE IF NOT EXISTS verse_sparse (
     verse_id    INTEGER PRIMARY KEY REFERENCES verse(id),
@@ -236,6 +236,19 @@ CREATE TABLE IF NOT EXISTS verse_sparse (
 );
 
 CREATE TABLE IF NOT EXISTS verse_colbert (
+    verse_id          INTEGER PRIMARY KEY REFERENCES verse(id),
+    num_tokens        INTEGER NOT NULL,
+    token_embeddings  BLOB NOT NULL  -- float16 numpy array, shape (num_tokens, 1024)
+);
+
+-- ─── Embedding Tables (context-free, per-verse independent) ───
+
+CREATE TABLE IF NOT EXISTS verse_sparse_noctx (
+    verse_id    INTEGER PRIMARY KEY REFERENCES verse(id),
+    weights     TEXT NOT NULL  -- JSON {token_id: weight}
+);
+
+CREATE TABLE IF NOT EXISTS verse_colbert_noctx (
     verse_id          INTEGER PRIMARY KEY REFERENCES verse(id),
     num_tokens        INTEGER NOT NULL,
     token_embeddings  BLOB NOT NULL  -- float16 numpy array, shape (num_tokens, 1024)

@@ -28,12 +28,14 @@ Cross-references, footnotes, and section headings all use `(book_id, chapter, ve
 - SWORD SpaPlatense imported as "Straubinger (SWORD)" — 35,791 verses
 - 344,795 cross-references from OpenBible.info
 - FTS5 full-text search working
+- BGE-M3 dual-mode embeddings: context-aware (late chunking) + context-free (independent)
+- Semantic search with hybrid scoring (dense + sparse + ColBERT)
 - No footnotes, commentaries, or section headings imported yet
 - PDF extraction approach for v28 still TBD
 
 ## Database Schema: `db/schema.sql`
 
-78 books (73 Catholic canon + 5 appendiceal for multi-Bible support). 21 tables.
+78 books (73 Catholic canon + 5 appendiceal for multi-Bible support). 24 tables in schema.sql (+ 3 sqlite-vec virtual tables created at runtime by `embed_verses.py`).
 
 Key design decisions:
 - **Multi-Bible ready**: `verse` has `bible_id` FK. `bible` entries are created by import scripts, not pre-seeded.
@@ -49,7 +51,7 @@ Key design decisions:
 python3 scripts/create_db.py        # Schema + seed 78 books, chapters, psalm maps (no Bible entries)
 python3 scripts/import_sword.py     # Import SWORD SpaPlatense Bible (requires pysword)
 python3 scripts/import_crossrefs.py # Import cross-references from OpenBible.info
-python3 scripts/embed_verses.py     # BGE-M3 embeddings with late chunking (requires GPU, optional deps)
+python3 scripts/embed_verses.py     # BGE-M3 embeddings: context-aware + context-free (requires GPU, optional deps)
 python3 scripts/validate_db.py      # Run DB integrity checks
 python3 scripts/query_bible.py      # Query utilities
 python3 scripts/semantic_search.py  # Semantic search CLI demo (requires embeddings)

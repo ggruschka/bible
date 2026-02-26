@@ -16,23 +16,25 @@ The database file `bible.db` is included in the repo. No build step needed — j
 
 ## Schema
 
-21 tables organized into five groups:
+24 tables in [`db/schema.sql`](db/schema.sql), plus 3 sqlite-vec virtual tables created at runtime:
 
 ```
 testament ─1:N─ book ─1:N─ chapter ─1:N─ verse ─N:1─ bible
                  │                          │
-                 ├── footnote               ├── verse_sparse    (BGE-M3 sparse weights)
-                 ├── cross_reference        ├── verse_colbert   (BGE-M3 token embeddings)
-                 ├── commentary             └── verse_vec*      (dense KNN, sqlite-vec)
-                 ├── section_heading
-                 ├── parallel_passage       chapter ── chapter_vec* (dense KNN)
-                 └── topic_verse
+                 ├── footnote               ├── verse_sparse         (context-aware sparse)
+                 ├── cross_reference        ├── verse_colbert        (context-aware ColBERT)
+                 ├── commentary             ├── verse_vec*           (context-aware dense KNN)
+                 ├── section_heading        ├── verse_sparse_noctx   (context-free sparse)
+                 ├── parallel_passage       ├── verse_colbert_noctx  (context-free ColBERT)
+                 └── topic_verse            └── verse_vec_noctx*     (context-free dense KNN)
+
+                                            chapter ── chapter_vec*  (dense KNN)
                                             * = virtual tables, created at runtime
 ```
 
 All annotations (footnotes, cross-references, section headings, commentary) reference verses by address `(book_id, chapter, verse)` — not by Bible-specific verse ID. This means annotations are automatically shared across all Bibles.
 
-See [`db/schema.sql`](db/schema.sql) for the full DDL.
+See [`db/schema.sql`](db/schema.sql) for the full DDL. The 3 vec virtual tables are created by `embed_verses.py` (requires sqlite-vec).
 
 ## Query Examples
 
@@ -117,13 +119,15 @@ BGE-M3 embeddings enable meaning-based verse search with three retrieval modes c
 | **Sparse** (learned token weights) | Keyword importance (neural BM25) | ~7 MB |
 | **ColBERT** (per-token embeddings) | Fine-grained token-level matching | ~2.2 GB |
 
-**Late chunking**: entire chapters are fed to the encoder so every verse token attends to the full chapter context, then per-verse embeddings are extracted from the hidden states (~3-4% improvement over naive per-verse encoding).
+**Dual embedding modes:**
+- **Context-aware** (late chunking): entire chapters fed to encoder, verses attend to full chapter context. Better for thematic/chapter-level search.
+- **Context-free**: each verse encoded independently. Better for verse-to-verse similarity and cross-reference discovery (wider similarity spread, less same-chapter bias).
 
 ### Setup
 
 ```bash
 pip install -r requirements-embeddings.txt   # FlagEmbedding + sqlite-vec
-python scripts/embed_verses.py               # ~70s on RTX 5090
+python scripts/embed_verses.py               # ~250s on RTX 5090 (both modes)
 ```
 
 ### Usage
@@ -133,6 +137,9 @@ from scripts.semantic_search import *
 
 # Find verses similar to a given verse (no model needed — reads from DB)
 find_similar('Gen', 1, 1, top_k=10)
+
+# Context-free mode: better for verse-to-verse matching
+find_similar('Gen', 1, 1, top_k=10, use_context=False, exclude_same_chapter=True)
 
 # Search by meaning (loads model lazily)
 search_meaning('el amor de Dios', top_k=10)
@@ -144,7 +151,7 @@ find_similar_chapters('Gen', 1, top_k=5)
 hierarchical_search('la resurrección de los muertos')
 
 # Discover novel cross-references not in OpenBible.info
-discover_crossrefs('John', 3, 16, top_k=50)
+discover_crossrefs('John', 3, 16, top_k=50, use_context=False, exclude_same_chapter=True)
 
 # Evaluate against high-vote cross-references
 evaluate_quality(sample_size=500)
@@ -169,7 +176,7 @@ Cross-references from Protestant datasets are automatically converted to LXX num
 bible/
 ├── bible.db                      # The database (ready to use)
 ├── db/
-│   └── schema.sql                # Full DDL (21 tables)
+│   └── schema.sql                # Full DDL (24 tables)
 ├── requirements-embeddings.txt   # Optional deps for semantic search
 └── scripts/
     ├── create_db.py              # Schema + seed reference data

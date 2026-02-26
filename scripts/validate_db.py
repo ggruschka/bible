@@ -214,7 +214,38 @@ def validate():
                 "ORDER BY id DESC LIMIT 1"
             ).fetchone()
             if log_row:
-                print(f"    Last embedding run: {log_row[0]}")
+                print(f"    Last context-aware run: {log_row[0]}")
+
+        # Context-free embeddings
+        try:
+            noctx_vec_count = conn.execute("SELECT COUNT(*) FROM verse_vec_noctx").fetchone()[0]
+        except Exception:
+            noctx_vec_count = 0
+
+        if noctx_vec_count == 0:
+            warn("No context-free embeddings found (run embed_verses.py)")
+        else:
+            if bid is not None and vec_count > 0:
+                check("verse_vec_noctx count matches verse count",
+                      noctx_vec_count == verse_count,
+                      f"noctx={noctx_vec_count}, verses={verse_count}")
+
+            noctx_sparse = conn.execute("SELECT COUNT(*) FROM verse_sparse_noctx").fetchone()[0]
+            check("verse_sparse_noctx matches verse_vec_noctx",
+                  noctx_sparse == noctx_vec_count,
+                  f"sparse={noctx_sparse}, vec={noctx_vec_count}")
+
+            noctx_colbert = conn.execute("SELECT COUNT(*) FROM verse_colbert_noctx").fetchone()[0]
+            check("verse_colbert_noctx matches verse_vec_noctx",
+                  noctx_colbert == noctx_vec_count,
+                  f"colbert={noctx_colbert}, vec={noctx_vec_count}")
+
+            log_row = conn.execute(
+                "SELECT message FROM import_log WHERE step='embed_verses_noctx' AND status='completed' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if log_row:
+                print(f"    Last context-free run: {log_row[0]}")
 
     # ─── Bible Info ───
     print("\n=== Bibles ===")

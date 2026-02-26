@@ -34,6 +34,13 @@ DENSE_DIM = 1024
 HYBRID_WEIGHTS = (0.4, 0.2, 0.4)  # dense, sparse, colbert
 
 
+def _table_names(use_context):
+    """Return (vec_table, sparse_table, colbert_table) based on context mode."""
+    if use_context:
+        return 'verse_vec', 'verse_sparse', 'verse_colbert'
+    return 'verse_vec_noctx', 'verse_sparse_noctx', 'verse_colbert_noctx'
+
+
 # ─── sqlite-vec helpers ───
 
 def serialize_float32(vec):
@@ -130,18 +137,15 @@ def normalize_scores(scores):
 
 # ─── Core Search Functions ───
 
-def _dense_knn_verse(conn, query_vec, top_k, bible_id=None):
-    """Dense KNN search over verse_vec. Returns [(verse_id, distance), ...]."""
-    sql = """
-        SELECT verse_id, distance FROM verse_vec
-        WHERE embedding MATCH ? AND k = ?
-    """
-    params = [serialize_float32(query_vec), top_k]
-
-    results = conn.execute(sql, params).fetchall()
+def _dense_knn_verse(conn, query_vec, top_k, bible_id=None, use_context=True):
+    """Dense KNN search over verse vectors. Returns [(verse_id, distance), ...]."""
+    vec_table = _table_names(use_context)[0]
+    results = conn.execute(
+        f"SELECT verse_id, distance FROM {vec_table} WHERE embedding MATCH ? AND k = ?",
+        [serialize_float32(query_vec), top_k]
+    ).fetchall()
 
     if bible_id is not None:
-        # Filter by bible_id (join with verse table)
         verse_ids = [r[0] for r in results]
         if not verse_ids:
             return []
@@ -163,20 +167,22 @@ def _dense_knn_chapter(conn, query_vec, top_k):
     """, [serialize_float32(query_vec), top_k]).fetchall()
 
 
-def _load_sparse(conn, verse_id):
+def _load_sparse(conn, verse_id, use_context=True):
     """Load sparse weights for a verse."""
+    sparse_table = _table_names(use_context)[1]
     row = conn.execute(
-        "SELECT weights FROM verse_sparse WHERE verse_id=?", (verse_id,)
+        f"SELECT weights FROM {sparse_table} WHERE verse_id=?", (verse_id,)
     ).fetchone()
     if row:
         return json.loads(row[0])
     return {}
 
 
-def _load_colbert(conn, verse_id):
+def _load_colbert(conn, verse_id, use_context=True):
     """Load ColBERT token embeddings for a verse as float32 numpy array."""
+    colbert_table = _table_names(use_context)[2]
     row = conn.execute(
-        "SELECT num_tokens, token_embeddings FROM verse_colbert WHERE verse_id=?",
+        f"SELECT num_tokens, token_embeddings FROM {colbert_table} WHERE verse_id=?",
         (verse_id,)
     ).fetchone()
     if row:
@@ -187,10 +193,11 @@ def _load_colbert(conn, verse_id):
     return None
 
 
-def _get_verse_dense(conn, verse_id):
-    """Read dense embedding for a verse from verse_vec."""
+def _get_verse_dense(conn, verse_id, use_context=True):
+    """Read dense embedding for a verse."""
+    vec_table = _table_names(use_context)[0]
     row = conn.execute(
-        "SELECT embedding FROM verse_vec WHERE verse_id=?", (verse_id,)
+        f"SELECT embedding FROM {vec_table} WHERE verse_id=?", (verse_id,)
     ).fetchone()
     if row:
         return np.frombuffer(row[0], dtype=np.float32)
@@ -234,7 +241,7 @@ def _chapter_info(conn, chapter_id):
     return None
 
 
-def _hybrid_rescore(conn, candidates, q_sparse, q_colbert, dense_weight=0.4, sparse_weight=0.2, colbert_weight=0.4):
+def _hybrid_rescore(conn, candidates, q_sparse, q_colbert, dense_weight=0.4, sparse_weight=0.2, colbert_weight=0.4, use_context=True):
     """Rescore dense candidates with sparse + ColBERT, return combined ranked results."""
     # candidates: [(verse_id, cosine_distance), ...]
     if not candidates:
@@ -252,14 +259,14 @@ def _hybrid_rescore(conn, candidates, q_sparse, q_colbert, dense_weight=0.4, spa
 
         # Sparse
         if q_sparse:
-            d_sparse = _load_sparse(conn, vid)
+            d_sparse = _load_sparse(conn, vid, use_context)
             sparse_scores.append(sparse_sim(q_sparse, d_sparse))
         else:
             sparse_scores.append(0.0)
 
         # ColBERT
         if q_colbert is not None:
-            d_colbert = _load_colbert(conn, vid)
+            d_colbert = _load_colbert(conn, vid, use_context)
             if d_colbert is not None:
                 colbert_scores.append(colbert_maxsim(q_colbert, d_colbert))
             else:
@@ -286,11 +293,11 @@ def _hybrid_rescore(conn, candidates, q_sparse, q_colbert, dense_weight=0.4, spa
 
 # ─── Public API ───
 
-def find_similar(book, chapter, verse, top_k=20, bible_id=None, exclude_same_chapter=False):
+def find_similar(book, chapter, verse, top_k=20, bible_id=None, exclude_same_chapter=False, use_context=True):
     """Find verses semantically similar to a given verse.
 
     Uses hybrid scoring: dense KNN → sparse + ColBERT rescore.
-    Dense-only if sparse/colbert unavailable for query verse.
+    Set use_context=False to use context-free embeddings (better for cross-ref discovery).
     Set exclude_same_chapter=True to filter out verses from the same chapter.
     """
     if bible_id is None:
@@ -315,20 +322,20 @@ def find_similar(book, chapter, verse, top_k=20, bible_id=None, exclude_same_cha
     verse_id = row[0]
 
     # Get dense embedding
-    query_vec = _get_verse_dense(conn, verse_id)
+    query_vec = _get_verse_dense(conn, verse_id, use_context)
     if query_vec is None:
         conn.close()
         return []
 
     # Dense KNN (fetch extra for bible_id filtering)
-    candidates = _dense_knn_verse(conn, query_vec, top_k * 3, bible_id)
+    candidates = _dense_knn_verse(conn, query_vec, top_k * 3, bible_id, use_context)
 
     # Load query sparse + colbert for rescoring
-    q_sparse = _load_sparse(conn, verse_id)
-    q_colbert = _load_colbert(conn, verse_id)
+    q_sparse = _load_sparse(conn, verse_id, use_context)
+    q_colbert = _load_colbert(conn, verse_id, use_context)
 
     # Hybrid rescore
-    scored = _hybrid_rescore(conn, candidates, q_sparse, q_colbert)
+    scored = _hybrid_rescore(conn, candidates, q_sparse, q_colbert, use_context=use_context)
 
     # Build results (exclude the query verse itself)
     results = []
@@ -349,10 +356,11 @@ def find_similar(book, chapter, verse, top_k=20, bible_id=None, exclude_same_cha
     return results
 
 
-def search_meaning(text, top_k=20, bible_id=None):
+def search_meaning(text, top_k=20, bible_id=None, use_context=True):
     """Search for verses by meaning using free text query.
 
     Encodes query with BGE-M3, then hybrid-scores candidates.
+    Set use_context=False to search against context-free embeddings.
     """
     if bible_id is None:
         bible_id = default_bible_id()
@@ -362,8 +370,8 @@ def search_meaning(text, top_k=20, bible_id=None):
     conn = get_conn()
     load_sqlite_vec(conn)
 
-    candidates = _dense_knn_verse(conn, q_dense, top_k * 5, bible_id)
-    scored = _hybrid_rescore(conn, candidates, q_sparse, q_colbert)
+    candidates = _dense_knn_verse(conn, q_dense, top_k * 5, bible_id, use_context)
+    scored = _hybrid_rescore(conn, candidates, q_sparse, q_colbert, use_context=use_context)
 
     results = []
     for vid, score, d, s, c in scored:
@@ -449,7 +457,7 @@ def search_chapters(text, top_k=10):
     return results
 
 
-def hierarchical_search(text, top_chapters=5, top_verses=10, bible_id=None):
+def hierarchical_search(text, top_chapters=5, top_verses=10, bible_id=None, use_context=True):
     """Two-stage search: find top chapters, then top verses within them."""
     if bible_id is None:
         bible_id = default_bible_id()
@@ -459,7 +467,7 @@ def hierarchical_search(text, top_chapters=5, top_verses=10, bible_id=None):
     conn = get_conn()
     load_sqlite_vec(conn)
 
-    # Stage 1: chapter-level
+    # Stage 1: chapter-level (always uses context-aware chapter_vec)
     ch_candidates = _dense_knn_chapter(conn, q_dense, top_chapters)
 
     results = []
@@ -479,7 +487,7 @@ def hierarchical_search(text, top_chapters=5, top_verses=10, bible_id=None):
         # Score each verse
         verse_scores = []
         for (vid,) in verse_ids:
-            d_vec = _get_verse_dense(conn, vid)
+            d_vec = _get_verse_dense(conn, vid, use_context)
             if d_vec is None:
                 continue
             # Cosine similarity (both L2-normalized)
@@ -503,10 +511,11 @@ def hierarchical_search(text, top_chapters=5, top_verses=10, bible_id=None):
     return results
 
 
-def discover_crossrefs(book, chapter, verse, top_k=50, bible_id=None, exclude_same_chapter=False):
+def discover_crossrefs(book, chapter, verse, top_k=50, bible_id=None, exclude_same_chapter=False, use_context=True):
     """Find semantically similar verses that are NOT in existing cross-references.
 
     Returns novel connections that could be new cross-references.
+    Set use_context=False for better verse-to-verse matching.
     Set exclude_same_chapter=True to filter out verses from the same chapter.
     """
     if bible_id is None:
@@ -514,7 +523,8 @@ def discover_crossrefs(book, chapter, verse, top_k=50, bible_id=None, exclude_sa
 
     # Get all similar verses
     similar = find_similar(book, chapter, verse, top_k=top_k, bible_id=bible_id,
-                           exclude_same_chapter=exclude_same_chapter)
+                           exclude_same_chapter=exclude_same_chapter,
+                           use_context=use_context)
     if not similar:
         return []
 
@@ -557,7 +567,7 @@ def discover_crossrefs(book, chapter, verse, top_k=50, bible_id=None, exclude_sa
     return novel
 
 
-def evaluate_quality(sample_size=500, bible_id=None):
+def evaluate_quality(sample_size=500, bible_id=None, use_context=True):
     """Evaluate embedding quality against high-vote cross-references.
 
     Samples verses that have high-vote (>100) cross-references and measures
@@ -601,7 +611,7 @@ def evaluate_quality(sample_size=500, bible_id=None):
         src_vid = src_row[0]
 
         # Get dense embedding
-        q_vec = _get_verse_dense(conn, src_vid)
+        q_vec = _get_verse_dense(conn, src_vid, use_context)
         if q_vec is None:
             continue
 
@@ -621,7 +631,7 @@ def evaluate_quality(sample_size=500, bible_id=None):
             continue
 
         # Dense KNN
-        candidates = _dense_knn_verse(conn, q_vec, 55, bible_id)
+        candidates = _dense_knn_verse(conn, q_vec, 55, bible_id, use_context)
 
         # Map candidates to addresses
         found_at_10 = 0
@@ -708,65 +718,69 @@ if __name__ == '__main__':
 
     # Check if verse_vec has data
     try:
-        count = conn.execute("SELECT COUNT(*) FROM verse_vec").fetchone()[0]
+        ctx_count = conn.execute("SELECT COUNT(*) FROM verse_vec").fetchone()[0]
     except Exception:
-        count = 0
+        ctx_count = 0
+    try:
+        noctx_count = conn.execute("SELECT COUNT(*) FROM verse_vec_noctx").fetchone()[0]
+    except Exception:
+        noctx_count = 0
 
-    if count == 0:
+    if ctx_count == 0 and noctx_count == 0:
         print("\nNo embeddings found. Run embed_verses.py first:")
         print("  python scripts/embed_verses.py")
         conn.close()
         sys.exit(1)
 
-    print(f"\n{count} verse embeddings loaded.\n")
+    print(f"\n  Context-aware:  {ctx_count} verse embeddings")
+    print(f"  Context-free:   {noctx_count} verse embeddings\n")
+    has_noctx = noctx_count > 0
     conn.close()
 
-    # 1. Find similar verses
-    print("\n1. find_similar('Gen', 1, 1)")
-    results = find_similar('Gen', 1, 1, top_k=10)
-    _print_verse_results(results, "Verses similar to Genesis 1:1")
+    # 1. Find similar verses (context-aware)
+    print("\n1. find_similar('Gen', 1, 1, use_context=True)")
+    results = find_similar('Gen', 1, 1, top_k=10, use_context=True)
+    _print_verse_results(results, "Genesis 1:1 — context-aware (late-chunked)")
 
-    # 2. Semantic search
-    print("\n2. search_meaning('el amor de Dios')")
+    # 2. Find similar verses (context-free) — compare
+    if has_noctx:
+        print("\n2. find_similar('Gen', 1, 1, use_context=False)")
+        results = find_similar('Gen', 1, 1, top_k=10, use_context=False)
+        _print_verse_results(results, "Genesis 1:1 — context-free (independent)")
+
+    # 3. Semantic search
+    print("\n3. search_meaning('el amor de Dios')")
     results = search_meaning('el amor de Dios', top_k=10)
     _print_verse_results(results, "Search: 'el amor de Dios'")
 
-    # 3. Similar chapters
-    print("\n3. find_similar_chapters('Gen', 1)")
+    # 4. Similar chapters
+    print("\n4. find_similar_chapters('Gen', 1)")
     results = find_similar_chapters('Gen', 1, top_k=5)
     _print_chapter_results(results, "Chapters similar to Genesis 1")
 
-    # 4. Hierarchical search
-    print("\n4. hierarchical_search('la resurrección de los muertos')")
-    results = hierarchical_search('la resurrección de los muertos', top_chapters=3, top_verses=5)
-    print(f"\n{'─'*60}")
-    print(f"  Hierarchical: 'la resurrección de los muertos'")
-    print(f"{'─'*60}")
-    for ch in results:
-        print(f"\n  Chapter: {ch['ref']} (similarity: {ch['similarity']:.3f})")
-        for i, v in enumerate(ch.get('verses', [])):
-            text = v['text'][:100] + ('...' if len(v.get('text', '')) > 100 else '')
-            print(f"    {i+1}. {v['ref']} ({v['score']:.3f}): {text}")
+    # 5. Discover cross-refs (context-free, exclude same chapter)
+    if has_noctx:
+        print("\n5. discover_crossrefs('Gen', 1, 1, use_context=False, exclude_same_chapter=True)")
+        results = discover_crossrefs('Gen', 1, 1, top_k=20, use_context=False, exclude_same_chapter=True)
+        _print_verse_results(results[:15], "Cross-ref discovery — context-free, cross-chapter", show_novel=True)
+        novel_count = sum(1 for r in results if r.get('is_novel'))
+        print(f"\n  Novel connections: {novel_count}/{len(results)}")
 
-    # 5. Discover novel cross-references
-    print("\n5. discover_crossrefs('John', 3, 16)")
-    results = discover_crossrefs('John', 3, 16, top_k=20)
-    _print_verse_results(results[:15], "Cross-ref discovery for John 3:16", show_novel=True)
-    novel_count = sum(1 for r in results if r.get('is_novel'))
-    print(f"\n  Novel connections: {novel_count}/{len(results)}")
-
-    # 6. Evaluate quality
-    print("\n6. evaluate_quality(sample_size=200)")
-    t0 = time.time()
-    metrics = evaluate_quality(sample_size=200)
-    elapsed = time.time() - t0
-    if metrics:
-        print(f"\n{'─'*60}")
-        print(f"  Evaluation Results ({metrics['evaluated']} verses, {elapsed:.1f}s)")
-        print(f"{'─'*60}")
-        print(f"  Recall@10:  {metrics['recall@10']:.3f}")
-        print(f"  Recall@50:  {metrics['recall@50']:.3f}")
-        print(f"  MRR:        {metrics['MRR']:.3f}")
+    # 6. Evaluate quality — compare both modes
+    print("\n6. Evaluation comparison")
+    for mode_name, use_ctx in [("context-aware", True), ("context-free", False)]:
+        if not use_ctx and not has_noctx:
+            continue
+        t0 = time.time()
+        metrics = evaluate_quality(sample_size=200, use_context=use_ctx)
+        elapsed = time.time() - t0
+        if metrics:
+            print(f"\n{'─'*60}")
+            print(f"  {mode_name} ({metrics['evaluated']} verses, {elapsed:.1f}s)")
+            print(f"{'─'*60}")
+            print(f"  Recall@10:  {metrics['recall@10']:.3f}")
+            print(f"  Recall@50:  {metrics['recall@50']:.3f}")
+            print(f"  MRR:        {metrics['MRR']:.3f}")
 
     print(f"\n{'='*60}")
     print("  Demo complete.")

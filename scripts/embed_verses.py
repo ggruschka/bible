@@ -292,6 +292,85 @@ def encode_chapter(model, tokenizer, sparse_linear, colbert_linear, verses, devi
     return results
 
 
+# ─── Context-Free Encoding ───
+
+@torch.no_grad()
+def encode_batch_nocontext(model, tokenizer, sparse_linear, colbert_linear, verses, device, batch_size=64):
+    """Encode verses independently (no chapter context).
+
+    Args:
+        verses: list of (verse_id, text) tuples
+        batch_size: number of verses per forward pass
+
+    Returns:
+        list of dicts with 'verse_id', 'dense', 'sparse', 'colbert', 'num_tokens'
+    """
+    results = []
+
+    for i in range(0, len(verses), batch_size):
+        batch = verses[i:i+batch_size]
+        texts = [text for _, text in batch]
+
+        inputs = tokenizer(
+            texts, padding=True, truncation=True,
+            max_length=512, return_tensors='pt'
+        ).to(device)
+
+        outputs = model(
+            input_ids=inputs['input_ids'],
+            attention_mask=inputs['attention_mask'],
+        )
+        hidden = outputs.last_hidden_state  # (batch, seq_len, 1024)
+        attention_mask = inputs['attention_mask']  # (batch, seq_len)
+
+        # Apply projection heads to all hidden states at once
+        sparse_out = torch.relu(sparse_linear(hidden)).squeeze(-1)  # (batch, seq_len)
+        colbert_out = colbert_linear(hidden)  # (batch, seq_len, 1024)
+        colbert_out = torch.nn.functional.normalize(colbert_out, p=2, dim=-1)
+
+        for j in range(len(batch)):
+            verse_id = batch[j][0]
+            mask = attention_mask[j]  # (seq_len,)
+            token_count = mask.sum().item()
+
+            # Real tokens: skip CLS (pos 0) and SEP (last real token)
+            if token_count <= 2:
+                continue
+            start = 1
+            end = token_count - 1
+
+            # Dense: mean-pool real tokens, L2-normalize
+            verse_hidden = hidden[j, start:end]
+            dense = verse_hidden.mean(dim=0)
+            dense = torch.nn.functional.normalize(dense, p=2, dim=0)
+            dense_np = dense.float().cpu().numpy()
+
+            # Sparse: max weight per token_id
+            verse_sparse = sparse_out[j, start:end]
+            verse_token_ids = inputs['input_ids'][j, start:end]
+            sparse_weights = {}
+            for ti in range(end - start):
+                w = verse_sparse[ti].item()
+                if w > 0:
+                    tid_str = str(verse_token_ids[ti].item())
+                    if tid_str not in sparse_weights or w > sparse_weights[tid_str]:
+                        sparse_weights[tid_str] = round(w, 4)
+
+            # ColBERT: per-token embeddings as float16
+            verse_colbert = colbert_out[j, start:end]
+            colbert_np = verse_colbert.half().cpu().numpy()
+
+            results.append({
+                'verse_id': verse_id,
+                'dense': dense_np,
+                'sparse': sparse_weights,
+                'colbert': colbert_np,
+                'num_tokens': end - start,
+            })
+
+    return results
+
+
 # ─── sqlite-vec helpers ───
 
 def serialize_float32(vec):
@@ -321,6 +400,12 @@ def create_vec_tables(conn):
             embedding float[{DENSE_DIM}] distance_metric=cosine
         )
     """)
+    conn.execute(f"""
+        CREATE VIRTUAL TABLE IF NOT EXISTS verse_vec_noctx USING vec0(
+            verse_id INTEGER PRIMARY KEY,
+            embedding float[{DENSE_DIM}] distance_metric=cosine
+        )
+    """)
 
 
 def create_regular_tables(conn):
@@ -333,6 +418,19 @@ def create_regular_tables(conn):
     """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS verse_colbert (
+            verse_id          INTEGER PRIMARY KEY REFERENCES verse(id),
+            num_tokens        INTEGER NOT NULL,
+            token_embeddings  BLOB NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS verse_sparse_noctx (
+            verse_id    INTEGER PRIMARY KEY REFERENCES verse(id),
+            weights     TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS verse_colbert_noctx (
             verse_id          INTEGER PRIMARY KEY REFERENCES verse(id),
             num_tokens        INTEGER NOT NULL,
             token_embeddings  BLOB NOT NULL
@@ -361,15 +459,14 @@ def get_bible_id(conn, bible_id):
     return row
 
 
-def get_existing_verse_ids(conn, verse_ids):
-    """Check which verse_ids already have embeddings in verse_vec."""
+def get_existing_verse_ids(conn, verse_ids, table='verse_sparse'):
+    """Check which verse_ids already have embeddings."""
     existing = set()
-    # Check in batches
     for i in range(0, len(verse_ids), 500):
         batch = verse_ids[i:i+500]
         placeholders = ','.join('?' * len(batch))
         rows = conn.execute(
-            f"SELECT verse_id FROM verse_sparse WHERE verse_id IN ({placeholders})",
+            f"SELECT verse_id FROM {table} WHERE verse_id IN ({placeholders})",
             batch
         ).fetchall()
         existing.update(r[0] for r in rows)
@@ -450,28 +547,38 @@ def main():
     all_verse_ids = [r[0] for r in rows]
     if args.force:
         print("Force mode: clearing existing embeddings...")
-        # Delete from vec tables
+        # Delete context-aware
         for vid in all_verse_ids:
             conn.execute("DELETE FROM verse_vec WHERE verse_id=?", (vid,))
+            conn.execute("DELETE FROM verse_vec_noctx WHERE verse_id=?", (vid,))
         conn.execute(
-            f"DELETE FROM verse_sparse WHERE verse_id IN "
-            f"(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
+            "DELETE FROM verse_sparse WHERE verse_id IN "
+            "(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
         )
         conn.execute(
-            f"DELETE FROM verse_colbert WHERE verse_id IN "
-            f"(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
+            "DELETE FROM verse_colbert WHERE verse_id IN "
+            "(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
+        )
+        # Delete context-free
+        conn.execute(
+            "DELETE FROM verse_sparse_noctx WHERE verse_id IN "
+            "(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
+        )
+        conn.execute(
+            "DELETE FROM verse_colbert_noctx WHERE verse_id IN "
+            "(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
         )
         # Delete chapter vectors
         conn.execute(
-            f"DELETE FROM chapter_vec WHERE chapter_id IN "
-            f"(SELECT DISTINCT chapter_id FROM verse WHERE bible_id=?)", (bible_id,)
+            "DELETE FROM chapter_vec WHERE chapter_id IN "
+            "(SELECT DISTINCT chapter_id FROM verse WHERE bible_id=?)", (bible_id,)
         )
         conn.commit()
         existing = set()
     else:
         existing = get_existing_verse_ids(conn, all_verse_ids)
         if existing:
-            print(f"  {len(existing)} verses already embedded, will skip")
+            print(f"  {len(existing)} context-aware embeddings exist, will skip")
 
     # Load model
     model, tokenizer, sparse_linear, colbert_linear = load_model(device)
@@ -570,31 +677,121 @@ def main():
         )
     conn.commit()
 
-    elapsed = time.time() - t_start
+    ctx_elapsed = time.time() - t_start
 
-    # DB size
-    db_size_mb = os.path.getsize(db_path) / (1024 * 1024)
-
-    # Update log
+    # Update log for context-aware pass
     conn.execute(
         "UPDATE import_log SET status=?, records=?, message=?, finished_at=datetime('now') WHERE id=?",
         ('completed', embedded_count,
-         f'BGE-M3: {embedded_count} verses, {len(chapter_vectors)} chapters in {elapsed:.1f}s',
+         f'BGE-M3 context-aware: {embedded_count} verses, {len(chapter_vectors)} chapters in {ctx_elapsed:.1f}s',
          log_id)
     )
     conn.commit()
 
-    print(f"\nDone!")
-    print(f"  Verses embedded: {embedded_count}")
-    print(f"  Chapters: {len(chapter_vectors)}")
-    print(f"  Time: {elapsed:.1f}s ({total_chapters / elapsed:.1f} chapters/s)")
-    print(f"  DB size: {db_size_mb:.1f} MB")
+    if embedded_count > 0:
+        print(f"\n  Context-aware pass: {embedded_count} verses, "
+              f"{len(chapter_vectors)} chapters in {ctx_elapsed:.1f}s")
+    else:
+        print(f"\n  Context-aware pass: skipped (already embedded)")
+
+    # ─── Context-Free Pass ───
+    print(f"\n{'='*60}")
+    print("Context-free pass (independent verse encoding)...")
+
+    # Check existing noctx embeddings
+    existing_noctx = get_existing_verse_ids(conn, all_verse_ids, table='verse_sparse_noctx')
+    if existing_noctx and not args.force:
+        print(f"  {len(existing_noctx)} context-free embeddings exist, will skip")
+
+    verses_for_noctx = [(vid, text) for vid, text in
+                        [(r[0], r[4] or '') for r in rows]
+                        if vid not in existing_noctx]
+
+    if not verses_for_noctx:
+        print("  All verses already have context-free embeddings.")
+        noctx_count = 0
+    else:
+        # Log start
+        conn.execute(
+            "INSERT INTO import_log (step, status, message, started_at) VALUES (?, ?, ?, datetime('now'))",
+            ('embed_verses_noctx', 'started', f'BGE-M3 context-free for bible_id={bible_id}')
+        )
+        noctx_log_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+
+        t_noctx = time.time()
+        noctx_count = 0
+        vec_batch = []
+        sparse_batch = []
+        colbert_batch = []
+
+        # Process in batches of 64 verses
+        encode_batch_size = 64
+        for bi in range(0, len(verses_for_noctx), encode_batch_size):
+            batch = verses_for_noctx[bi:bi+encode_batch_size]
+            batch_results = encode_batch_nocontext(
+                model, tokenizer, sparse_linear, colbert_linear,
+                batch, device, batch_size=encode_batch_size
+            )
+
+            for vr in batch_results:
+                vec_batch.append((vr['verse_id'], serialize_float32(vr['dense'])))
+                sparse_batch.append((vr['verse_id'], json.dumps(vr['sparse'])))
+                colbert_batch.append((
+                    vr['verse_id'],
+                    vr['num_tokens'],
+                    vr['colbert'].tobytes()
+                ))
+                noctx_count += 1
+
+            if len(vec_batch) >= BATCH_SIZE:
+                _flush_batches_noctx(conn, vec_batch, sparse_batch, colbert_batch)
+                vec_batch.clear()
+                sparse_batch.clear()
+                colbert_batch.clear()
+
+            total_batches = (len(verses_for_noctx) + encode_batch_size - 1) // encode_batch_size
+            current_batch = bi // encode_batch_size + 1
+            if current_batch % 50 == 0:
+                elapsed = time.time() - t_noctx
+                rate = noctx_count / elapsed if elapsed > 0 else 0
+                eta = (len(verses_for_noctx) - noctx_count) / rate if rate > 0 else 0
+                print(f"  Batch {current_batch}/{total_batches} — "
+                      f"{noctx_count} verses — "
+                      f"{rate:.0f} v/s — ETA {eta:.0f}s")
+
+        # Final flush
+        if vec_batch:
+            _flush_batches_noctx(conn, vec_batch, sparse_batch, colbert_batch)
+
+        noctx_elapsed = time.time() - t_noctx
+
+        conn.execute(
+            "UPDATE import_log SET status=?, records=?, message=?, finished_at=datetime('now') WHERE id=?",
+            ('completed', noctx_count,
+             f'BGE-M3 context-free: {noctx_count} verses in {noctx_elapsed:.1f}s',
+             noctx_log_id)
+        )
+        conn.commit()
+
+        print(f"\n  Context-free pass: {noctx_count} verses in {noctx_elapsed:.1f}s")
+
+    # Summary
+    total_elapsed = time.time() - t_start
+    db_size_mb = os.path.getsize(db_path) / (1024 * 1024)
+
+    print(f"\n{'='*60}")
+    print(f"Done!")
+    print(f"  Context-aware:  {embedded_count} verses, {len(chapter_vectors)} chapters")
+    print(f"  Context-free:   {len(verses_for_noctx)} verses")
+    print(f"  Total time:     {total_elapsed:.1f}s")
+    print(f"  DB size:        {db_size_mb:.1f} MB")
 
     conn.close()
 
 
 def _flush_batches(conn, vec_batch, sparse_batch, colbert_batch):
-    """Insert accumulated embeddings into the database."""
+    """Insert accumulated context-aware embeddings into the database."""
     for vid, emb in vec_batch:
         conn.execute(
             "INSERT OR REPLACE INTO verse_vec (verse_id, embedding) VALUES (?, ?)",
@@ -606,6 +803,24 @@ def _flush_batches(conn, vec_batch, sparse_batch, colbert_batch):
     )
     conn.executemany(
         "INSERT OR REPLACE INTO verse_colbert (verse_id, num_tokens, token_embeddings) VALUES (?, ?, ?)",
+        colbert_batch
+    )
+    conn.commit()
+
+
+def _flush_batches_noctx(conn, vec_batch, sparse_batch, colbert_batch):
+    """Insert accumulated context-free embeddings into the database."""
+    for vid, emb in vec_batch:
+        conn.execute(
+            "INSERT OR REPLACE INTO verse_vec_noctx (verse_id, embedding) VALUES (?, ?)",
+            (vid, emb)
+        )
+    conn.executemany(
+        "INSERT OR REPLACE INTO verse_sparse_noctx (verse_id, weights) VALUES (?, ?)",
+        sparse_batch
+    )
+    conn.executemany(
+        "INSERT OR REPLACE INTO verse_colbert_noctx (verse_id, num_tokens, token_embeddings) VALUES (?, ?, ?)",
         colbert_batch
     )
     conn.commit()
