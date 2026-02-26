@@ -162,6 +162,85 @@ CREATE TABLE IF NOT EXISTS commentary (
 
 CREATE INDEX IF NOT EXISTS idx_commentary_verse ON commentary(book_id, chapter_start, verse_start);
 
+-- ─── Parallel Passages ───
+
+CREATE TABLE IF NOT EXISTS parallel_group (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT,
+    description     TEXT,
+    source_dataset  TEXT NOT NULL DEFAULT 'manual'
+);
+
+CREATE TABLE IF NOT EXISTS parallel_passage (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_id        INTEGER NOT NULL REFERENCES parallel_group(id),
+    book_id         INTEGER NOT NULL REFERENCES book(id),
+    chapter_start   INTEGER NOT NULL,
+    verse_start     INTEGER NOT NULL,
+    chapter_end     INTEGER,
+    verse_end       INTEGER,
+    position        INTEGER,
+    UNIQUE(group_id, book_id, chapter_start, verse_start)
+);
+
+CREATE INDEX IF NOT EXISTS idx_parallel_book ON parallel_passage(book_id, chapter_start, verse_start);
+
+-- ─── Semantic Clusters ───
+
+CREATE TABLE IF NOT EXISTS semantic_cluster (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT,
+    description     TEXT,
+    parent_id       INTEGER REFERENCES semantic_cluster(id),
+    model_name      TEXT NOT NULL,
+    algorithm       TEXT,
+    num_verses      INTEGER,
+    created_at      TEXT DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS cluster_verse (
+    cluster_id      INTEGER NOT NULL REFERENCES semantic_cluster(id),
+    verse_id        INTEGER NOT NULL REFERENCES verse(id),
+    similarity      REAL,
+    PRIMARY KEY(cluster_id, verse_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cluster_verse ON cluster_verse(verse_id);
+
+-- ─── Topic Chains ───
+
+CREATE TABLE IF NOT EXISTS topic (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL,
+    description     TEXT,
+    parent_id       INTEGER REFERENCES topic(id),
+    source          TEXT NOT NULL DEFAULT 'manual'
+);
+
+CREATE TABLE IF NOT EXISTS topic_verse (
+    topic_id        INTEGER NOT NULL REFERENCES topic(id),
+    book_id         INTEGER NOT NULL REFERENCES book(id),
+    chapter_number  INTEGER NOT NULL,
+    verse_number    INTEGER NOT NULL,
+    position        INTEGER,
+    PRIMARY KEY(topic_id, book_id, chapter_number, verse_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_topic_verse_addr ON topic_verse(book_id, chapter_number, verse_number);
+
+-- ─── Embedding Tables ───
+
+CREATE TABLE IF NOT EXISTS verse_sparse (
+    verse_id    INTEGER PRIMARY KEY REFERENCES verse(id),
+    weights     TEXT NOT NULL  -- JSON {token_id: weight}
+);
+
+CREATE TABLE IF NOT EXISTS verse_colbert (
+    verse_id          INTEGER PRIMARY KEY REFERENCES verse(id),
+    num_tokens        INTEGER NOT NULL,
+    token_embeddings  BLOB NOT NULL  -- float16 numpy array, shape (num_tokens, 1024)
+);
+
 -- ─── Metadata Tables ───
 
 CREATE TABLE IF NOT EXISTS section_heading (

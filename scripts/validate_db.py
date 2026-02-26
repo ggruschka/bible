@@ -36,21 +36,16 @@ def validate():
         print(f"  [WARN] {name}{suffix}")
 
     # Get the primary bible ID (the one with actual verse data)
-    bid = conn.execute(
+    bid_row = conn.execute(
         "SELECT bible_id FROM verse GROUP BY bible_id ORDER BY COUNT(*) DESC LIMIT 1"
     ).fetchone()
-    if not bid:
-        bid = conn.execute("SELECT id FROM bible ORDER BY id LIMIT 1").fetchone()
-    if not bid:
-        print("ERROR: No Bibles found in database")
-        return False
-    bid = bid[0]
+    bid = bid_row[0] if bid_row else None
 
     # ─── Structure Checks ───
     print("\n=== Structure ===")
 
     books = conn.execute("SELECT COUNT(*) FROM book").fetchone()[0]
-    check("73 books", books == 73, f"got {books}")
+    check("78 books", books == 78, f"got {books}")
 
     testaments = conn.execute("SELECT COUNT(*) FROM testament").fetchone()[0]
     check("2 testaments", testaments == 2)
@@ -64,61 +59,54 @@ def validate():
     # ─── Verse Checks ───
     print("\n=== Verses ===")
 
-    total_verses = conn.execute(
-        "SELECT COUNT(*) FROM verse WHERE bible_id=?", (bid,)).fetchone()[0]
-    check("Verse count >= 35000", total_verses >= 35000, f"got {total_verses}")
-
-    # All books have verses
-    empty_books = conn.execute('''
-        SELECT b.name_es FROM book b
-        LEFT JOIN verse v ON v.book_id = b.id AND v.bible_id = ?
-        GROUP BY b.id HAVING COUNT(v.id) = 0
-    ''', (bid,)).fetchall()
-    check("All books have verses", len(empty_books) == 0,
-          f"empty: {[r[0] for r in empty_books]}" if empty_books else "")
-
-    # All chapters have verses
-    empty_chapters = conn.execute('''
-        SELECT b.name_es, c.number FROM chapter c
-        JOIN book b ON c.book_id = b.id
-        LEFT JOIN verse v ON v.chapter_id = c.id AND v.bible_id = ?
-        GROUP BY c.id HAVING COUNT(v.id) = 0
-    ''', (bid,)).fetchall()
-    if empty_chapters:
-        warn(f"{len(empty_chapters)} chapters with 0 verses",
-             f"e.g. {empty_chapters[0][0]} ch.{empty_chapters[0][1]}")
+    if bid is None:
+        warn("No Bible with verses imported yet")
     else:
-        check("All chapters have verses", True)
+        total_verses = conn.execute(
+            "SELECT COUNT(*) FROM verse WHERE bible_id=?", (bid,)).fetchone()[0]
+        check("Verse count >= 30000", total_verses >= 30000, f"got {total_verses}")
 
-    # Spot check specific verses
-    gen11 = conn.execute('''
-        SELECT text_clean FROM verse v JOIN book b ON v.book_id=b.id
-        WHERE b.slug='genesis' AND v.chapter_number=1 AND v.verse_number=1 AND v.bible_id=?
-    ''', (bid,)).fetchone()
-    check("Gen 1:1 exists", gen11 is not None)
-    if gen11:
-        check("Gen 1:1 text correct",
-              gen11[0].startswith("Al principio creó Dios"),
-              f"got: {gen11[0][:50]}")
+        # Check canonical books have verses (exclude appendiceal books which may be empty)
+        empty_canonical = conn.execute('''
+            SELECT b.name_es FROM book b
+            LEFT JOIN verse v ON v.book_id = b.id AND v.bible_id = ?
+            WHERE b.category != 'appendix'
+            GROUP BY b.id HAVING COUNT(v.id) = 0
+        ''', (bid,)).fetchall()
+        if empty_canonical:
+            warn(f"{len(empty_canonical)} canonical books with 0 verses",
+                 f"e.g. {empty_canonical[0][0]}")
+        else:
+            check("All canonical books have verses", True)
+
+        # Spot check specific verses
+        gen11 = conn.execute('''
+            SELECT text_clean FROM verse v JOIN book b ON v.book_id=b.id
+            WHERE b.slug='genesis' AND v.chapter_number=1 AND v.verse_number=1 AND v.bible_id=?
+        ''', (bid,)).fetchone()
+        check("Gen 1:1 exists", gen11 is not None)
+        if gen11:
+            check("Gen 1:1 has text", len(gen11[0]) > 10, f"got: {gen11[0][:80]}")
 
     # ─── Footnote Checks ───
     print("\n=== Footnotes ===")
 
     fn_count = conn.execute("SELECT COUNT(*) FROM footnote").fetchone()[0]
-    check("Footnote count >= 9000", fn_count >= 9000, f"got {fn_count}")
+    if fn_count == 0:
+        warn("No footnotes imported yet")
+    else:
+        check("Footnotes present", fn_count > 0, f"got {fn_count}")
 
-    # Footnotes with valid book references
-    orphan_fn = conn.execute('''
-        SELECT COUNT(*) FROM footnote f
-        LEFT JOIN book b ON f.book_id = b.id
-        WHERE b.id IS NULL
-    ''').fetchone()[0]
-    check("All footnotes reference valid books", orphan_fn == 0, f"got {orphan_fn} orphans")
+        orphan_fn = conn.execute('''
+            SELECT COUNT(*) FROM footnote f
+            LEFT JOIN book b ON f.book_id = b.id
+            WHERE b.id IS NULL
+        ''').fetchone()[0]
+        check("All footnotes reference valid books", orphan_fn == 0, f"got {orphan_fn} orphans")
 
-    # Empty footnotes
-    empty_fn = conn.execute(
-        "SELECT COUNT(*) FROM footnote WHERE text IS NULL OR text = ''").fetchone()[0]
-    check("No empty footnotes", empty_fn == 0, f"got {empty_fn}")
+        empty_fn = conn.execute(
+            "SELECT COUNT(*) FROM footnote WHERE text IS NULL OR text = ''").fetchone()[0]
+        check("No empty footnotes", empty_fn == 0, f"got {empty_fn}")
 
     # ─── Cross-Reference Checks ───
     print("\n=== Cross-References ===")
@@ -159,11 +147,74 @@ def validate():
     check("FTS5 in sync with verse table", fts_count == all_verses,
           f"fts={fts_count}, verses={all_verses}")
 
-    # Test search
-    search_result = conn.execute(
-        "SELECT COUNT(*) FROM verse_fts WHERE text_clean MATCH 'pastor'"
-    ).fetchone()[0]
-    check("FTS5 search works", search_result > 0, f"'pastor' → {search_result} results")
+    if all_verses > 0:
+        search_result = conn.execute(
+            "SELECT COUNT(*) FROM verse_fts WHERE text_clean MATCH 'pastor'"
+        ).fetchone()[0]
+        check("FTS5 search works", search_result > 0, f"'pastor' → {search_result} results")
+
+    # ─── Embeddings (optional) ───
+    print("\n=== Embeddings ===")
+
+    has_vec = False
+    try:
+        import sqlite_vec
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        has_vec = True
+    except (ImportError, Exception):
+        pass
+
+    if not has_vec:
+        warn("sqlite-vec extension not available — skipping embedding checks")
+    else:
+        # Check verse_vec
+        try:
+            vec_count = conn.execute("SELECT COUNT(*) FROM verse_vec").fetchone()[0]
+        except Exception:
+            vec_count = 0
+
+        if vec_count == 0:
+            warn("No verse embeddings found (run embed_verses.py)")
+        else:
+            if bid is not None:
+                verse_count = conn.execute(
+                    "SELECT COUNT(*) FROM verse WHERE bible_id=?", (bid,)
+                ).fetchone()[0]
+                check("verse_vec count matches verse count",
+                      vec_count == verse_count,
+                      f"vec={vec_count}, verses={verse_count}")
+            else:
+                print(f"    verse_vec: {vec_count} embeddings")
+
+            # Check chapter_vec
+            try:
+                ch_vec_count = conn.execute("SELECT COUNT(*) FROM chapter_vec").fetchone()[0]
+            except Exception:
+                ch_vec_count = 0
+            chapter_count = conn.execute("SELECT COUNT(*) FROM chapter").fetchone()[0]
+            check("chapter_vec has entries", ch_vec_count > 0,
+                  f"got {ch_vec_count}/{chapter_count}")
+
+            # Check sparse and colbert consistency
+            sparse_count = conn.execute("SELECT COUNT(*) FROM verse_sparse").fetchone()[0]
+            check("verse_sparse matches verse_vec",
+                  sparse_count == vec_count,
+                  f"sparse={sparse_count}, vec={vec_count}")
+
+            colbert_count = conn.execute("SELECT COUNT(*) FROM verse_colbert").fetchone()[0]
+            check("verse_colbert matches verse_vec",
+                  colbert_count == vec_count,
+                  f"colbert={colbert_count}, vec={vec_count}")
+
+            # Report model info from import_log
+            log_row = conn.execute(
+                "SELECT message FROM import_log WHERE step='embed_verses' AND status='completed' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if log_row:
+                print(f"    Last embedding run: {log_row[0]}")
 
     # ─── Bible Info ───
     print("\n=== Bibles ===")

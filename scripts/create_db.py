@@ -4,12 +4,12 @@ Step 1: Create the Bible database and seed reference data.
 
 Creates the SQLite database, applies schema, and populates:
 - testament (2 rows)
-- bible (2 rows: Straubinger 1948 + v28)
-- book (73 rows: full Catholic canon)
+- book (78 rows: Catholic canon + appendiceal books for multi-Bible support)
 - chapter (all chapters for all books)
 - osis_book_map (standard OSIS IDs → book.id)
 - psalm_number_map (LXX ↔ Hebrew psalm numbering)
-- commentary_source (1 row: Straubinger)
+
+Bible entries are NOT seeded here — they are created by import scripts.
 """
 
 import sqlite3
@@ -20,7 +20,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'bible.db')
 SCHEMA_PATH = os.path.join(os.path.dirname(__file__), '..', 'db', 'schema.sql')
 
 
-# ─── Book data: all 73 books of the Catholic canon ───
+# ─── Book data: 78 books (Catholic canon + appendiceal for multi-Bible support) ───
 # (id, testament_id, name_es, name_en, abbrev_es, abbrev_en, slug, osis_id,
 #  total_chapters, category, alt_name_es)
 BOOKS = [
@@ -106,6 +106,12 @@ BOOKS = [
     (72, 2, 'Judas', 'Jude', 'Jds', 'Jude', 'judas', 'Jude', 1, 'epistle', None),
     # ── Apocalypse ──
     (73, 2, 'Apocalipsis', 'Revelation', 'Apoc', 'Rev', 'apocalipsis', 'Rev', 22, 'apocalypse', None),
+    # ── Appendiceal (for multi-Bible support: Orthodox, Vulgate, etc.) ──
+    (74, 1, 'Oración de Manasés', 'Prayer of Manasseh', 'OrMan', 'PrMan', 'oracion-de-manases', 'PrMan', 1, 'appendix', None),
+    (75, 1, '1 Esdras', '1 Esdras', '1 Esd', '1Esd', '1-esdras', '1Esd', 9, 'appendix', '3 Esdras'),
+    (76, 1, '2 Esdras', '2 Esdras', '2 Esd', '2Esd', '2-esdras', '2Esd', 16, 'appendix', '4 Esdras'),
+    (77, 1, 'Salmo 151', 'Additional Psalm', 'Sal151', 'AddPs', 'salmo-151', 'AddPs', 1, 'appendix', None),
+    (78, 2, 'Laodicenses', 'Laodiceans', 'Lao', 'EpLao', 'laodicenses', 'EpLao', 1, 'appendix', None),
 ]
 
 # Additional OSIS IDs used by Protestant Bibles (not in Catholic canon)
@@ -192,27 +198,7 @@ def create_database():
     )
     print("Inserted 2 testaments.")
 
-    # ─── Bible: Straubinger ───
-    cur.execute(
-        """INSERT INTO bible (name, full_name, language, canon, parent_id, method, year, description)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        ('Straubinger', 'Sagrada Biblia - Mons. Dr. Juan Straubinger',
-         'es', 'catholic', None, 'human', 1948,
-         'Traducción directa de los textos primitivos por Mons. Dr. Juan Straubinger')
-    )
-    print("Inserted Straubinger Bible.")
-
-    # ─── Bible: Straubinger v28 (Corrección 28, January 2024) ───
-    cur.execute(
-        """INSERT INTO bible (name, full_name, language, canon, parent_id, method, year, description)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-        ('Straubinger v28', 'Sagrada Biblia Straubinger - Corrección 28',
-         'es', 'catholic', 1, 'human', 2024,
-         'Corrección 28 (Enero 2024) de la traducción Straubinger, revisada por Padre Jeromín León')
-    )
-    print("Inserted Straubinger v28 Bible.")
-
-    # ─── Books (73) ───
+    # ─── Books ───
     cur.executemany(
         """INSERT INTO book (id, testament_id, name_es, name_en, abbrev_es, abbrev_en,
                              slug, osis_id, total_chapters, category, alt_name_es)
@@ -250,19 +236,9 @@ def create_database():
     )
     print(f"Inserted {len(psalm_map)} psalm number mappings.")
 
-    # ─── Commentary source: Straubinger ───
-    cur.execute(
-        """INSERT INTO commentary_source (name, full_name, description, language, year)
-           VALUES (?, ?, ?, ?, ?)""",
-        ('Straubinger', 'Mons. Dr. Juan Straubinger',
-         'Notas de la Sagrada Biblia, traducción directa de los textos primitivos',
-         'es', 1948)
-    )
-    print("Inserted Straubinger commentary source.")
-
     # ─── Log completion ───
     finished = datetime.now().isoformat()
-    total_records = 2 + 1 + len(BOOKS) + chapter_count + len(osis_rows) + len(psalm_map) + 1
+    total_records = 2 + len(BOOKS) + chapter_count + len(osis_rows) + len(psalm_map)
     cur.execute(
         """UPDATE import_log SET status=?, records=?, message=?, finished_at=?
            WHERE id=?""",
