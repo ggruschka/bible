@@ -12,7 +12,14 @@ A SQLite database designed to hold **multiple Bibles** with shared cross-referen
 | Verses | 35,791 |
 | Cross-references | 344,795 |
 
-The database file `bible.db` is included in the repo. No build step needed — just query it.
+`bible.db` is not included in the repo (too large with embeddings). Build it locally:
+
+```bash
+python scripts/create_db.py          # Schema + seed data
+python scripts/import_sword.py       # Import verses (requires pysword)
+python scripts/import_crossrefs.py   # Import cross-references
+python scripts/embed_verses.py       # Optional: embeddings (requires GPU)
+```
 
 ## Schema
 
@@ -174,7 +181,7 @@ Cross-references from Protestant datasets are automatically converted to LXX num
 
 ```
 bible/
-├── bible.db                      # The database (ready to use)
+├── bible.db                      # Built locally (gitignored)
 ├── db/
 │   └── schema.sql                # Full DDL (24 tables)
 ├── requirements-embeddings.txt   # Optional deps for semantic search
