@@ -23,25 +23,31 @@ python scripts/embed_verses.py       # Optional: embeddings (requires GPU)
 
 ## Schema
 
-24 tables in [`db/schema.sql`](db/schema.sql), plus 3 sqlite-vec virtual tables created at runtime:
+24 tables in [`db/schema.sql`](db/schema.sql), plus optional embedding storage:
 
 ```
 testament ─1:N─ book ─1:N─ chapter ─1:N─ verse ─N:1─ bible
-                 │                          │
-                 ├── footnote               ├── verse_sparse         (context-aware sparse)
-                 ├── cross_reference        ├── verse_colbert        (context-aware ColBERT)
-                 ├── commentary             ├── verse_vec*           (context-aware dense KNN)
-                 ├── section_heading        ├── verse_sparse_noctx   (context-free sparse)
-                 ├── parallel_passage       ├── verse_colbert_noctx  (context-free ColBERT)
-                 └── topic_verse            └── verse_vec_noctx*     (context-free dense KNN)
-
-                                            chapter ── chapter_vec*  (dense KNN)
-                                            * = virtual tables, created at runtime
+                 │
+                 ├── footnote
+                 ├── cross_reference
+                 ├── commentary
+                 ├── section_heading
+                 ├── parallel_passage
+                 └── topic_verse
 ```
+
+**Embedding storage** (choose one or both backends):
+
+| Backend | Tables / Collections | Notes |
+|---------|---------------------|-------|
+| **sqlite-vec** (default) | 3 virtual tables (`verse_vec`, `chapter_vec`, `verse_vec_noctx`) + 4 regular tables | In-process, no server needed |
+| **Qdrant** (optional) | 3 collections (`verses_ctx`, `verses_noctx`, `chapters`) | Docker server, HNSW indexes, on-disk vectors |
+
+Both backends coexist. Use `--backend sqlite|qdrant` to select.
 
 All annotations (footnotes, cross-references, section headings, commentary) reference verses by address `(book_id, chapter, verse)` — not by Bible-specific verse ID. This means annotations are automatically shared across all Bibles.
 
-See [`db/schema.sql`](db/schema.sql) for the full DDL. The 3 vec virtual tables are created by `embed_verses.py` (requires sqlite-vec).
+See [`db/schema.sql`](db/schema.sql) for the full DDL.
 
 ## Query Examples
 
@@ -133,8 +139,14 @@ BGE-M3 embeddings enable meaning-based verse search with three retrieval modes c
 ### Setup
 
 ```bash
-pip install -r requirements-embeddings.txt   # FlagEmbedding + sqlite-vec
-python scripts/embed_verses.py               # ~250s on RTX 5090 (both modes)
+pip install -r requirements-embeddings.txt   # FlagEmbedding + sqlite-vec + qdrant-client
+
+# sqlite-vec backend (default, in-process)
+python scripts/embed_verses.py --backend sqlite  # ~250s on RTX 5090 (both modes)
+
+# Qdrant backend (optional, requires Docker)
+docker run -d --name qdrant -p 6333:6333 -v $(pwd)/qdrant_data:/qdrant/storage qdrant/qdrant:latest
+python scripts/embed_verses.py --backend qdrant --force
 ```
 
 ### Usage
@@ -147,6 +159,9 @@ find_similar('Gen', 1, 1, top_k=10)
 
 # Context-free mode: better for verse-to-verse matching
 find_similar('Gen', 1, 1, top_k=10, use_context=False, exclude_same_chapter=True)
+
+# Same with Qdrant backend
+find_similar('Gen', 1, 1, top_k=10, backend='qdrant')
 
 # Search by meaning (loads model lazily)
 search_meaning('el amor de Dios', top_k=10)
@@ -162,6 +177,7 @@ discover_crossrefs('John', 3, 16, top_k=50, use_context=False, exclude_same_chap
 
 # Evaluate against high-vote cross-references
 evaluate_quality(sample_size=500)
+evaluate_quality(sample_size=500, backend='qdrant')  # compare backends
 ```
 
 ## Psalm Numbering
@@ -189,8 +205,8 @@ bible/
     ├── create_db.py              # Schema + seed reference data
     ├── import_sword.py           # Import a SWORD module (requires pysword)
     ├── import_crossrefs.py       # Import cross-references from OpenBible.info
-    ├── embed_verses.py           # BGE-M3 embeddings with late chunking (GPU)
-    ├── semantic_search.py        # Hybrid semantic search + cross-ref discovery
+    ├── embed_verses.py           # BGE-M3 embeddings (--backend sqlite|qdrant, GPU)
+    ├── semantic_search.py        # Hybrid semantic search + cross-ref discovery (dual backend)
     ├── validate_db.py            # Database validation checks
     └── query_bible.py            # Query utilities
 ```
@@ -208,3 +224,4 @@ bible/
 - SQLite 3.35+ (for FTS5 support)
 - No external Python dependencies (except `pysword` for SWORD imports)
 - Optional: `pip install -r requirements-embeddings.txt` for semantic search (GPU recommended)
+- Optional: Docker for Qdrant backend (`docker run -d --name qdrant -p 6333:6333 qdrant/qdrant:latest`)

@@ -3,6 +3,9 @@ bible.db
 bible.db-wal
 bible.db-shm
 
+# Qdrant vector storage (rebuild with embed_verses.py --backend qdrant)
+qdrant_data/
+
 # Backup of previous import attempt
 _backup/
 

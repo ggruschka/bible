@@ -7,17 +7,22 @@ encoder so every token attends to the full chapter context, then extracts
 per-verse embeddings from the hidden states.
 
 Produces three embedding types per verse:
-  - Dense: 1024-dim L2-normalized vector (stored in sqlite-vec virtual table)
-  - Sparse: learned token weights via sparse_linear head (stored as JSON)
-  - ColBERT: per-token 1024-dim embeddings (stored as float16 blob)
+  - Dense: 1024-dim L2-normalized vector
+  - Sparse: learned token weights via sparse_linear head
+  - ColBERT: per-token 1024-dim embeddings (float16)
 
 Plus chapter-level dense vectors (length-weighted mean of verse vectors).
 
+Supports two storage backends:
+  - sqlite: sqlite-vec virtual tables + regular tables (default)
+  - qdrant: Qdrant server collections (requires Docker)
+
 Usage:
-    python scripts/embed_verses.py [--bible-id N] [--device cuda|cpu] [--force]
+    python scripts/embed_verses.py [--backend sqlite|qdrant] [--bible-id N] [--device cuda|cpu] [--force]
 
 Requires: pip install -r requirements-embeddings.txt
           Also: torch, transformers (installed by FlagEmbedding)
+          For Qdrant: docker run -d --name qdrant -p 6333:6333 -v $(pwd)/qdrant_data:/qdrant/storage qdrant/qdrant:latest
 """
 
 import argparse
@@ -42,6 +47,8 @@ BATCH_SIZE = 1000  # DB transaction batch size
 DENSE_DIM = 1024
 
 DB_PATH = os.path.join(os.path.dirname(__file__), '..', 'bible.db')
+QDRANT_URL = os.environ.get('QDRANT_URL', 'http://localhost:6333')
+QDRANT_BATCH_SIZE = 20  # Qdrant upsert batch size (ColBERT multivectors are large)
 
 
 # ─── Model Loading ───
@@ -438,6 +445,125 @@ def create_regular_tables(conn):
     """)
 
 
+# ─── Qdrant helpers ───
+
+def get_qdrant_client():
+    """Connect to Qdrant server."""
+    from qdrant_client import QdrantClient
+    return QdrantClient(url=QDRANT_URL)
+
+
+def create_qdrant_collections(client, force=False):
+    """Create Qdrant collections for verse and chapter embeddings.
+
+    All vectors stored on disk (memmap). At 70K points, OS page cache
+    gives near-RAM speed after warmup.
+    """
+    from qdrant_client import models
+
+    verse_collections = ['verses_ctx', 'verses_noctx']
+    for name in verse_collections:
+        if force and client.collection_exists(name):
+            client.delete_collection(name)
+        if not client.collection_exists(name):
+            client.create_collection(
+                collection_name=name,
+                vectors_config={
+                    "dense": models.VectorParams(
+                        size=DENSE_DIM, distance=models.Distance.COSINE,
+                        on_disk=True),
+                    "colbert": models.VectorParams(
+                        size=DENSE_DIM, distance=models.Distance.COSINE,
+                        on_disk=True,
+                        multivector_config=models.MultiVectorConfig(
+                            comparator=models.MultiVectorComparator.MAX_SIM),
+                        hnsw_config=models.HnswConfigDiff(m=0)),
+                },
+                sparse_vectors_config={
+                    "sparse": models.SparseVectorParams(
+                        modifier=models.Modifier.IDF),
+                },
+            )
+            client.create_payload_index(
+                name, "bible_id", models.PayloadSchemaType.INTEGER)
+            client.create_payload_index(
+                name, "book_id", models.PayloadSchemaType.INTEGER)
+
+    # Chapters: dense only
+    if force and client.collection_exists('chapters'):
+        client.delete_collection('chapters')
+    if not client.collection_exists('chapters'):
+        client.create_collection(
+            collection_name='chapters',
+            vectors_config=models.VectorParams(
+                size=DENSE_DIM, distance=models.Distance.COSINE,
+                on_disk=True),
+        )
+        client.create_payload_index(
+            'chapters', "bible_id", models.PayloadSchemaType.INTEGER)
+        client.create_payload_index(
+            'chapters', "book_id", models.PayloadSchemaType.INTEGER)
+
+
+def get_existing_qdrant_ids(client, collection_name):
+    """Get all point IDs from a Qdrant collection."""
+    existing = set()
+    offset = None
+    while True:
+        results, offset = client.scroll(
+            collection_name, limit=1000, offset=offset,
+            with_payload=False, with_vectors=False)
+        existing.update(p.id for p in results)
+        if offset is None:
+            break
+    return existing
+
+
+def make_verse_point(vr, bible_id, verse_meta):
+    """Build a Qdrant PointStruct from verse embedding results."""
+    from qdrant_client import models
+    book_id, ch_num, v_num = verse_meta[vr['verse_id']]
+    sparse = vr['sparse']
+    return models.PointStruct(
+        id=vr['verse_id'],
+        vector={
+            "dense": vr['dense'].tolist(),
+            "sparse": models.SparseVector(
+                indices=[int(k) for k in sparse.keys()],
+                values=list(sparse.values()),
+            ),
+            "colbert": vr['colbert'].astype(np.float32).tolist(),
+        },
+        payload={
+            "bible_id": bible_id,
+            "book_id": book_id,
+            "chapter_number": ch_num,
+            "verse_number": v_num,
+        },
+    )
+
+
+def make_chapter_point(ch_id, ch_vec, bible_id, book_id):
+    """Build a Qdrant PointStruct for a chapter vector."""
+    from qdrant_client import models
+    return models.PointStruct(
+        id=ch_id,
+        vector=ch_vec.tolist(),
+        payload={
+            "bible_id": bible_id,
+            "book_id": book_id,
+        },
+    )
+
+
+def flush_qdrant(client, collection_name, points):
+    """Upsert points to Qdrant in sub-batches to respect payload size limits."""
+    if not points:
+        return
+    for i in range(0, len(points), QDRANT_BATCH_SIZE):
+        client.upsert(collection_name, points=points[i:i+QDRANT_BATCH_SIZE])
+
+
 # ─── Main Pipeline ───
 
 def get_bible_id(conn, bible_id):
@@ -460,7 +586,7 @@ def get_bible_id(conn, bible_id):
 
 
 def get_existing_verse_ids(conn, verse_ids, table='verse_sparse'):
-    """Check which verse_ids already have embeddings."""
+    """Check which verse_ids already have embeddings (sqlite backend)."""
     existing = set()
     for i in range(0, len(verse_ids), 500):
         batch = verse_ids[i:i+500]
@@ -475,10 +601,14 @@ def get_existing_verse_ids(conn, verse_ids, table='verse_sparse'):
 
 def main():
     parser = argparse.ArgumentParser(description='Embed Bible verses using BGE-M3')
+    parser.add_argument('--backend', choices=['sqlite', 'qdrant'], default='qdrant',
+                        help='Storage backend (default: qdrant)')
     parser.add_argument('--bible-id', type=int, default=None, help='Bible ID to embed')
     parser.add_argument('--device', choices=['cuda', 'cpu'], default=None, help='Force device')
     parser.add_argument('--force', action='store_true', help='Drop and recreate embeddings')
     args = parser.parse_args()
+
+    backend = args.backend
 
     # Device selection
     if args.device:
@@ -494,27 +624,39 @@ def main():
         gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         print(f"Using GPU: {gpu_name} ({gpu_mem:.0f} GB)")
 
-    # Connect to DB
+    # Connect to DB (always needed — verse data is in sqlite)
     db_path = os.path.abspath(DB_PATH)
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
 
     bible_id, bible_name = get_bible_id(conn, args.bible_id)
-    print(f"Embedding Bible: {bible_name} (id={bible_id})")
+    print(f"Embedding Bible: {bible_name} (id={bible_id}), backend={backend}")
 
     # Log start
     conn.execute(
         "INSERT INTO import_log (step, status, message, started_at) VALUES (?, ?, ?, datetime('now'))",
-        ('embed_verses', 'started', f'BGE-M3 embeddings for bible_id={bible_id}')
+        ('embed_verses', 'started', f'BGE-M3 embeddings for bible_id={bible_id} ({backend})')
     )
     log_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
 
-    # Load sqlite-vec and create tables
-    load_sqlite_vec(conn)
-    create_vec_tables(conn)
-    create_regular_tables(conn)
+    # Setup storage backend
+    qclient = None
+    if backend == 'sqlite':
+        load_sqlite_vec(conn)
+        create_vec_tables(conn)
+        create_regular_tables(conn)
+    else:
+        qclient = get_qdrant_client()
+        try:
+            qclient.get_collections()
+        except Exception as e:
+            print(f"Error: Cannot connect to Qdrant at {QDRANT_URL}: {e}")
+            print("Start Qdrant: docker run -d --name qdrant -p 6333:6333 "
+                  "-v $(pwd)/qdrant_data:/qdrant/storage qdrant/qdrant:latest")
+            sys.exit(1)
+        create_qdrant_collections(qclient, force=args.force)
 
     # Load all verses grouped by chapter
     rows = conn.execute("""
@@ -529,6 +671,12 @@ def main():
         print("No verses found.")
         conn.close()
         return
+
+    # Build verse metadata (for Qdrant payloads)
+    verse_meta = {}
+    for row in rows:
+        vid, book_id, ch_num, v_num, text, ch_id = row
+        verse_meta[vid] = (book_id, ch_num, v_num)
 
     # Group by chapter
     chapters = {}
@@ -546,37 +694,39 @@ def main():
     # Check existing embeddings
     all_verse_ids = [r[0] for r in rows]
     if args.force:
-        print("Force mode: clearing existing embeddings...")
-        # Delete context-aware
-        for vid in all_verse_ids:
-            conn.execute("DELETE FROM verse_vec WHERE verse_id=?", (vid,))
-            conn.execute("DELETE FROM verse_vec_noctx WHERE verse_id=?", (vid,))
-        conn.execute(
-            "DELETE FROM verse_sparse WHERE verse_id IN "
-            "(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
-        )
-        conn.execute(
-            "DELETE FROM verse_colbert WHERE verse_id IN "
-            "(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
-        )
-        # Delete context-free
-        conn.execute(
-            "DELETE FROM verse_sparse_noctx WHERE verse_id IN "
-            "(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
-        )
-        conn.execute(
-            "DELETE FROM verse_colbert_noctx WHERE verse_id IN "
-            "(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
-        )
-        # Delete chapter vectors
-        conn.execute(
-            "DELETE FROM chapter_vec WHERE chapter_id IN "
-            "(SELECT DISTINCT chapter_id FROM verse WHERE bible_id=?)", (bible_id,)
-        )
-        conn.commit()
+        if backend == 'sqlite':
+            print("Force mode: clearing existing sqlite embeddings...")
+            for vid in all_verse_ids:
+                conn.execute("DELETE FROM verse_vec WHERE verse_id=?", (vid,))
+                conn.execute("DELETE FROM verse_vec_noctx WHERE verse_id=?", (vid,))
+            conn.execute(
+                "DELETE FROM verse_sparse WHERE verse_id IN "
+                "(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
+            )
+            conn.execute(
+                "DELETE FROM verse_colbert WHERE verse_id IN "
+                "(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
+            )
+            conn.execute(
+                "DELETE FROM verse_sparse_noctx WHERE verse_id IN "
+                "(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
+            )
+            conn.execute(
+                "DELETE FROM verse_colbert_noctx WHERE verse_id IN "
+                "(SELECT id FROM verse WHERE bible_id=?)", (bible_id,)
+            )
+            conn.execute(
+                "DELETE FROM chapter_vec WHERE chapter_id IN "
+                "(SELECT DISTINCT chapter_id FROM verse WHERE bible_id=?)", (bible_id,)
+            )
+            conn.commit()
+        # Qdrant already cleared by create_qdrant_collections(force=True)
         existing = set()
     else:
-        existing = get_existing_verse_ids(conn, all_verse_ids)
+        if backend == 'sqlite':
+            existing = get_existing_verse_ids(conn, all_verse_ids)
+        else:
+            existing = get_existing_qdrant_ids(qclient, 'verses_ctx')
         if existing:
             print(f"  {len(existing)} context-aware embeddings exist, will skip")
 
@@ -586,12 +736,15 @@ def main():
     # Process chapters
     t_start = time.time()
     embedded_count = 0
-    chapter_vectors = []  # (chapter_id, dense_vec)
+    chapter_vectors = []  # (chapter_id, dense_vec, book_id)
 
-    # Batch accumulators for DB inserts
-    vec_batch = []
-    sparse_batch = []
-    colbert_batch = []
+    # Batch accumulators
+    if backend == 'sqlite':
+        vec_batch = []
+        sparse_batch = []
+        colbert_batch = []
+    else:
+        qdrant_batch = []
 
     chapter_items = list(chapters.items())
     for ci, ((book_id, ch_num, ch_id), verses) in enumerate(chapter_items):
@@ -604,8 +757,6 @@ def main():
             all_in_chapter = verses
 
         if not verses_to_embed and not args.force:
-            # Still need chapter vector if not yet computed
-            # Skip entirely if all verses already done
             if ci % 200 == 0:
                 print(f"  Chapter {ci+1}/{total_chapters} (skipped)")
             continue
@@ -627,13 +778,16 @@ def main():
             if vr['verse_id'] in existing:
                 continue
 
-            vec_batch.append((vr['verse_id'], serialize_float32(vr['dense'])))
-            sparse_batch.append((vr['verse_id'], json.dumps(vr['sparse'])))
-            colbert_batch.append((
-                vr['verse_id'],
-                vr['num_tokens'],
-                vr['colbert'].tobytes()
-            ))
+            if backend == 'sqlite':
+                vec_batch.append((vr['verse_id'], serialize_float32(vr['dense'])))
+                sparse_batch.append((vr['verse_id'], json.dumps(vr['sparse'])))
+                colbert_batch.append((
+                    vr['verse_id'],
+                    vr['num_tokens'],
+                    vr['colbert'].tobytes()
+                ))
+            else:
+                qdrant_batch.append(make_verse_point(vr, bible_id, verse_meta))
             embedded_count += 1
 
         # Chapter dense = length-weighted mean of verse dense vectors
@@ -647,14 +801,19 @@ def main():
             norm = np.linalg.norm(chapter_dense)
             if norm > 0:
                 chapter_dense /= norm
-            chapter_vectors.append((ch_id, chapter_dense))
+            chapter_vectors.append((ch_id, chapter_dense, book_id))
 
         # Flush batches
-        if len(vec_batch) >= BATCH_SIZE:
-            _flush_batches(conn, vec_batch, sparse_batch, colbert_batch)
-            vec_batch.clear()
-            sparse_batch.clear()
-            colbert_batch.clear()
+        if backend == 'sqlite':
+            if len(vec_batch) >= BATCH_SIZE:
+                _flush_batches(conn, vec_batch, sparse_batch, colbert_batch)
+                vec_batch.clear()
+                sparse_batch.clear()
+                colbert_batch.clear()
+        else:
+            if len(qdrant_batch) >= QDRANT_BATCH_SIZE:
+                flush_qdrant(qclient, 'verses_ctx', qdrant_batch)
+                qdrant_batch.clear()
 
         if (ci + 1) % 100 == 0:
             elapsed = time.time() - t_start
@@ -665,17 +824,27 @@ def main():
                   f"{rate:.1f} ch/s — ETA {eta:.0f}s")
 
     # Final flush
-    if vec_batch:
-        _flush_batches(conn, vec_batch, sparse_batch, colbert_batch)
+    if backend == 'sqlite':
+        if vec_batch:
+            _flush_batches(conn, vec_batch, sparse_batch, colbert_batch)
+    else:
+        if qdrant_batch:
+            flush_qdrant(qclient, 'verses_ctx', qdrant_batch)
 
     # Insert chapter vectors
     print(f"Inserting {len(chapter_vectors)} chapter vectors...")
-    for ch_id, ch_vec in chapter_vectors:
-        conn.execute(
-            "INSERT OR REPLACE INTO chapter_vec (chapter_id, embedding) VALUES (?, ?)",
-            (ch_id, serialize_float32(ch_vec))
-        )
-    conn.commit()
+    if backend == 'sqlite':
+        for ch_id, ch_vec, _book_id in chapter_vectors:
+            conn.execute(
+                "INSERT OR REPLACE INTO chapter_vec (chapter_id, embedding) VALUES (?, ?)",
+                (ch_id, serialize_float32(ch_vec))
+            )
+        conn.commit()
+    else:
+        ch_points = [make_chapter_point(ch_id, ch_vec, bible_id, book_id)
+                     for ch_id, ch_vec, book_id in chapter_vectors]
+        for i in range(0, len(ch_points), QDRANT_BATCH_SIZE):
+            flush_qdrant(qclient, 'chapters', ch_points[i:i+QDRANT_BATCH_SIZE])
 
     ctx_elapsed = time.time() - t_start
 
@@ -683,7 +852,7 @@ def main():
     conn.execute(
         "UPDATE import_log SET status=?, records=?, message=?, finished_at=datetime('now') WHERE id=?",
         ('completed', embedded_count,
-         f'BGE-M3 context-aware: {embedded_count} verses, {len(chapter_vectors)} chapters in {ctx_elapsed:.1f}s',
+         f'BGE-M3 context-aware ({backend}): {embedded_count} verses, {len(chapter_vectors)} chapters in {ctx_elapsed:.1f}s',
          log_id)
     )
     conn.commit()
@@ -699,7 +868,10 @@ def main():
     print("Context-free pass (independent verse encoding)...")
 
     # Check existing noctx embeddings
-    existing_noctx = get_existing_verse_ids(conn, all_verse_ids, table='verse_sparse_noctx')
+    if backend == 'sqlite':
+        existing_noctx = get_existing_verse_ids(conn, all_verse_ids, table='verse_sparse_noctx')
+    else:
+        existing_noctx = get_existing_qdrant_ids(qclient, 'verses_noctx')
     if existing_noctx and not args.force:
         print(f"  {len(existing_noctx)} context-free embeddings exist, will skip")
 
@@ -714,16 +886,20 @@ def main():
         # Log start
         conn.execute(
             "INSERT INTO import_log (step, status, message, started_at) VALUES (?, ?, ?, datetime('now'))",
-            ('embed_verses_noctx', 'started', f'BGE-M3 context-free for bible_id={bible_id}')
+            ('embed_verses_noctx', 'started', f'BGE-M3 context-free for bible_id={bible_id} ({backend})')
         )
         noctx_log_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()
 
         t_noctx = time.time()
         noctx_count = 0
-        vec_batch = []
-        sparse_batch = []
-        colbert_batch = []
+
+        if backend == 'sqlite':
+            vec_batch = []
+            sparse_batch = []
+            colbert_batch = []
+        else:
+            qdrant_batch = []
 
         # Process in batches of 64 verses
         encode_batch_size = 64
@@ -735,20 +911,28 @@ def main():
             )
 
             for vr in batch_results:
-                vec_batch.append((vr['verse_id'], serialize_float32(vr['dense'])))
-                sparse_batch.append((vr['verse_id'], json.dumps(vr['sparse'])))
-                colbert_batch.append((
-                    vr['verse_id'],
-                    vr['num_tokens'],
-                    vr['colbert'].tobytes()
-                ))
+                if backend == 'sqlite':
+                    vec_batch.append((vr['verse_id'], serialize_float32(vr['dense'])))
+                    sparse_batch.append((vr['verse_id'], json.dumps(vr['sparse'])))
+                    colbert_batch.append((
+                        vr['verse_id'],
+                        vr['num_tokens'],
+                        vr['colbert'].tobytes()
+                    ))
+                else:
+                    qdrant_batch.append(make_verse_point(vr, bible_id, verse_meta))
                 noctx_count += 1
 
-            if len(vec_batch) >= BATCH_SIZE:
-                _flush_batches_noctx(conn, vec_batch, sparse_batch, colbert_batch)
-                vec_batch.clear()
-                sparse_batch.clear()
-                colbert_batch.clear()
+            if backend == 'sqlite':
+                if len(vec_batch) >= BATCH_SIZE:
+                    _flush_batches_noctx(conn, vec_batch, sparse_batch, colbert_batch)
+                    vec_batch.clear()
+                    sparse_batch.clear()
+                    colbert_batch.clear()
+            else:
+                if len(qdrant_batch) >= QDRANT_BATCH_SIZE:
+                    flush_qdrant(qclient, 'verses_noctx', qdrant_batch)
+                    qdrant_batch.clear()
 
             total_batches = (len(verses_for_noctx) + encode_batch_size - 1) // encode_batch_size
             current_batch = bi // encode_batch_size + 1
@@ -761,15 +945,19 @@ def main():
                       f"{rate:.0f} v/s — ETA {eta:.0f}s")
 
         # Final flush
-        if vec_batch:
-            _flush_batches_noctx(conn, vec_batch, sparse_batch, colbert_batch)
+        if backend == 'sqlite':
+            if vec_batch:
+                _flush_batches_noctx(conn, vec_batch, sparse_batch, colbert_batch)
+        else:
+            if qdrant_batch:
+                flush_qdrant(qclient, 'verses_noctx', qdrant_batch)
 
         noctx_elapsed = time.time() - t_noctx
 
         conn.execute(
             "UPDATE import_log SET status=?, records=?, message=?, finished_at=datetime('now') WHERE id=?",
             ('completed', noctx_count,
-             f'BGE-M3 context-free: {noctx_count} verses in {noctx_elapsed:.1f}s',
+             f'BGE-M3 context-free ({backend}): {noctx_count} verses in {noctx_elapsed:.1f}s',
              noctx_log_id)
         )
         conn.commit()
@@ -781,11 +969,16 @@ def main():
     db_size_mb = os.path.getsize(db_path) / (1024 * 1024)
 
     print(f"\n{'='*60}")
-    print(f"Done!")
+    print(f"Done! (backend={backend})")
     print(f"  Context-aware:  {embedded_count} verses, {len(chapter_vectors)} chapters")
     print(f"  Context-free:   {len(verses_for_noctx)} verses")
     print(f"  Total time:     {total_elapsed:.1f}s")
     print(f"  DB size:        {db_size_mb:.1f} MB")
+
+    if backend == 'qdrant':
+        for col_name in ['verses_ctx', 'verses_noctx', 'chapters']:
+            info = qclient.get_collection(col_name)
+            print(f"  Qdrant {col_name}: {info.points_count} points")
 
     conn.close()
 

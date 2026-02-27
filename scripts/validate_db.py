@@ -247,6 +247,48 @@ def validate():
             if log_row:
                 print(f"    Last context-free run: {log_row[0]}")
 
+    # ─── Qdrant Embeddings (optional) ───
+    print("\n=== Qdrant Embeddings ===")
+
+    qdrant_ok = False
+    try:
+        from qdrant_client import QdrantClient
+        qdrant_url = os.environ.get('QDRANT_URL', 'http://localhost:6333')
+        qclient = QdrantClient(url=qdrant_url)
+        qclient.get_collections()
+        qdrant_ok = True
+    except Exception:
+        pass
+
+    if not qdrant_ok:
+        warn("Qdrant server not available — skipping Qdrant checks")
+    else:
+        for col_name, label in [('verses_ctx', 'context-aware'),
+                                ('verses_noctx', 'context-free'),
+                                ('chapters', 'chapters')]:
+            try:
+                info = qclient.get_collection(col_name)
+                q_count = info.points_count
+            except Exception:
+                q_count = 0
+
+            if q_count == 0:
+                warn(f"Qdrant {col_name}: no points (run embed_verses.py --backend qdrant)")
+            else:
+                if col_name == 'chapters':
+                    chapter_count = conn.execute("SELECT COUNT(*) FROM chapter").fetchone()[0]
+                    check(f"Qdrant {col_name} has entries",
+                          q_count > 0, f"got {q_count}/{chapter_count}")
+                elif bid is not None:
+                    verse_count = conn.execute(
+                        "SELECT COUNT(*) FROM verse WHERE bible_id=?", (bid,)
+                    ).fetchone()[0]
+                    check(f"Qdrant {col_name} matches verse count",
+                          q_count == verse_count,
+                          f"qdrant={q_count}, verses={verse_count}")
+                else:
+                    print(f"    Qdrant {col_name}: {q_count} points")
+
     # ─── Bible Info ───
     print("\n=== Bibles ===")
 

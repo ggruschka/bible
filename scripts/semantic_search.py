@@ -5,8 +5,12 @@ Semantic search for the Bible database using BGE-M3 embeddings.
 Supports hybrid search (dense + sparse + ColBERT), cross-reference discovery,
 chapter-level search, hierarchical search, and quality evaluation.
 
+Two storage backends:
+  - sqlite: sqlite-vec virtual tables + manual hybrid rescoring (default)
+  - qdrant: Qdrant server with prefetch/RRF/ColBERT rescore (single query)
+
 Dense-only searches (find_similar, find_similar_chapters) work without loading
-the model — they read embeddings directly from the database.
+the model — they read embeddings directly from the database/Qdrant.
 
 Model is loaded lazily only when encoding user query text.
 
@@ -32,6 +36,7 @@ from query_bible import resolve_book, get_conn, default_bible_id
 
 DENSE_DIM = 1024
 HYBRID_WEIGHTS = (0.4, 0.2, 0.4)  # dense, sparse, colbert
+QDRANT_URL = os.environ.get('QDRANT_URL', 'http://localhost:6333')
 
 
 def _table_names(use_context):
@@ -39,6 +44,11 @@ def _table_names(use_context):
     if use_context:
         return 'verse_vec', 'verse_sparse', 'verse_colbert'
     return 'verse_vec_noctx', 'verse_sparse_noctx', 'verse_colbert_noctx'
+
+
+def _qdrant_collection(use_context):
+    """Return Qdrant collection name based on context mode."""
+    return 'verses_ctx' if use_context else 'verses_noctx'
 
 
 # ─── sqlite-vec helpers ───
@@ -60,6 +70,30 @@ def load_sqlite_vec(conn):
         return True
     except (ImportError, Exception) as e:
         print(f"Warning: sqlite-vec not available: {e}")
+        return False
+
+
+# ─── Qdrant helpers ───
+
+_qdrant_client = None
+
+
+def _get_qdrant():
+    """Get or create Qdrant client (cached)."""
+    global _qdrant_client
+    if _qdrant_client is None:
+        from qdrant_client import QdrantClient
+        _qdrant_client = QdrantClient(url=QDRANT_URL)
+    return _qdrant_client
+
+
+def _qdrant_available():
+    """Check if Qdrant server is reachable."""
+    try:
+        client = _get_qdrant()
+        client.get_collections()
+        return True
+    except Exception:
         return False
 
 
@@ -105,7 +139,7 @@ def encode_query(text):
     return dense, sparse_str, colbert
 
 
-# ─── Scoring Functions ───
+# ─── Scoring Functions (sqlite backend) ───
 
 def sparse_sim(q_weights, d_weights):
     """Compute sparse similarity between query and document weight dicts."""
@@ -135,7 +169,7 @@ def normalize_scores(scores):
     return [(s - mn) / rng for s in scores]
 
 
-# ─── Core Search Functions ───
+# ─── Core Search Functions (sqlite) ───
 
 def _dense_knn_verse(conn, query_vec, top_k, bible_id=None, use_context=True):
     """Dense KNN search over verse vectors. Returns [(verse_id, distance), ...]."""
@@ -291,20 +325,131 @@ def _hybrid_rescore(conn, candidates, q_sparse, q_colbert, dense_weight=0.4, spa
     return combined
 
 
+# ─── Qdrant Search Functions ───
+
+def _qdrant_hybrid_verse(q_dense, q_sparse, q_colbert, top_k, bible_id=None, use_context=True):
+    """Hybrid search via Qdrant: dense+sparse → RRF → ColBERT rescore.
+
+    Returns list of (verse_id, score) tuples.
+    """
+    from qdrant_client import models
+
+    client = _get_qdrant()
+    collection = _qdrant_collection(use_context)
+
+    # Build filter
+    q_filter = None
+    if bible_id is not None:
+        q_filter = models.Filter(must=[
+            models.FieldCondition(
+                key="bible_id",
+                match=models.MatchValue(value=bible_id)),
+        ])
+
+    # Build sparse vector
+    sparse_vec = models.SparseVector(
+        indices=[int(k) for k in q_sparse.keys()],
+        values=list(q_sparse.values()),
+    )
+
+    # Hybrid: prefetch dense+sparse → RRF fusion → ColBERT rescore
+    results = client.query_points(
+        collection_name=collection,
+        prefetch=[
+            models.Prefetch(
+                prefetch=[
+                    models.Prefetch(
+                        query=q_dense.tolist(),
+                        using="dense",
+                        limit=top_k * 5,
+                        filter=q_filter,
+                    ),
+                    models.Prefetch(
+                        query=sparse_vec,
+                        using="sparse",
+                        limit=top_k * 5,
+                        filter=q_filter,
+                    ),
+                ],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                limit=top_k * 3,
+            ),
+        ],
+        query=q_colbert.tolist(),
+        using="colbert",
+        limit=top_k,
+        with_payload=True,
+    )
+
+    return [(p.id, p.score) for p in results.points]
+
+
+def _qdrant_dense_verse(q_dense, top_k, bible_id=None, use_context=True):
+    """Dense-only search via Qdrant. Returns list of (verse_id, score) tuples."""
+    from qdrant_client import models
+
+    client = _get_qdrant()
+    collection = _qdrant_collection(use_context)
+
+    q_filter = None
+    if bible_id is not None:
+        q_filter = models.Filter(must=[
+            models.FieldCondition(
+                key="bible_id",
+                match=models.MatchValue(value=bible_id)),
+        ])
+
+    results = client.query_points(
+        collection_name=collection,
+        query=q_dense.tolist(),
+        using="dense",
+        limit=top_k,
+        with_payload=True,
+        query_filter=q_filter,
+    )
+
+    return [(p.id, p.score) for p in results.points]
+
+
+def _qdrant_dense_chapter(q_dense, top_k):
+    """Dense chapter search via Qdrant. Returns list of (chapter_id, score) tuples."""
+    client = _get_qdrant()
+
+    results = client.query_points(
+        collection_name='chapters',
+        query=q_dense.tolist(),
+        limit=top_k,
+        with_payload=True,
+    )
+
+    return [(p.id, p.score) for p in results.points]
+
+
+def _qdrant_get_verse_dense(verse_id, use_context=True):
+    """Read dense embedding for a verse from Qdrant."""
+    client = _get_qdrant()
+    collection = _qdrant_collection(use_context)
+
+    results = client.retrieve(collection, ids=[verse_id], with_vectors=["dense"])
+    if results:
+        return np.array(results[0].vector["dense"], dtype=np.float32)
+    return None
+
+
 # ─── Public API ───
 
-def find_similar(book, chapter, verse, top_k=20, bible_id=None, exclude_same_chapter=False, use_context=True):
+def find_similar(book, chapter, verse, top_k=20, bible_id=None, exclude_same_chapter=False, use_context=True, backend='qdrant'):
     """Find verses semantically similar to a given verse.
 
     Uses hybrid scoring: dense KNN → sparse + ColBERT rescore.
     Set use_context=False to use context-free embeddings (better for cross-ref discovery).
     Set exclude_same_chapter=True to filter out verses from the same chapter.
+    Set backend='qdrant' to use Qdrant server instead of sqlite-vec.
     """
     if bible_id is None:
         bible_id = default_bible_id()
 
     conn = get_conn()
-    load_sqlite_vec(conn)
 
     book_id, _ = resolve_book(conn, book)
     if book_id is None:
@@ -321,79 +466,136 @@ def find_similar(book, chapter, verse, top_k=20, bible_id=None, exclude_same_cha
         return []
     verse_id = row[0]
 
-    # Get dense embedding
-    query_vec = _get_verse_dense(conn, verse_id, use_context)
-    if query_vec is None:
-        conn.close()
-        return []
+    if backend == 'qdrant':
+        # Get dense embedding from Qdrant
+        query_vec = _qdrant_get_verse_dense(verse_id, use_context)
+        if query_vec is None:
+            conn.close()
+            return []
 
-    # Dense KNN (fetch extra for bible_id filtering)
-    candidates = _dense_knn_verse(conn, query_vec, top_k * 3, bible_id, use_context)
+        # Retrieve full vectors for hybrid search
+        client = _get_qdrant()
+        collection = _qdrant_collection(use_context)
+        point_data = client.retrieve(
+            collection, ids=[verse_id],
+            with_vectors=["dense", "colbert"],
+        )
+        if not point_data:
+            conn.close()
+            return []
 
-    # Load query sparse + colbert for rescoring
-    q_sparse = _load_sparse(conn, verse_id, use_context)
-    q_colbert = _load_colbert(conn, verse_id, use_context)
+        q_dense = np.array(point_data[0].vector["dense"], dtype=np.float32)
+        q_colbert = np.array(point_data[0].vector["colbert"], dtype=np.float32)
 
-    # Hybrid rescore
-    scored = _hybrid_rescore(conn, candidates, q_sparse, q_colbert, use_context=use_context)
+        # Build sparse from Qdrant point
+        sparse_point = client.retrieve(collection, ids=[verse_id], with_vectors=["sparse"])
+        if sparse_point and sparse_point[0].vector.get("sparse"):
+            sv = sparse_point[0].vector["sparse"]
+            q_sparse = {str(idx): val for idx, val in zip(sv.indices, sv.values)}
+        else:
+            q_sparse = {}
 
-    # Build results (exclude the query verse itself)
-    results = []
-    for vid, score, d, s, c in scored:
-        if vid == verse_id:
-            continue
-        info = _verse_info(conn, vid)
-        if info:
-            if exclude_same_chapter and info['book_id'] == book_id and info['chapter'] == chapter:
+        # Hybrid search
+        scored = _qdrant_hybrid_verse(q_dense, q_sparse, q_colbert, top_k + 1, bible_id, use_context)
+
+        results = []
+        for vid, score in scored:
+            if vid == verse_id:
                 continue
-            info['score'] = score
-            info['scores'] = {'dense': d, 'sparse': s, 'colbert': c}
-            results.append(info)
-        if len(results) >= top_k:
-            break
+            info = _verse_info(conn, vid)
+            if info:
+                if exclude_same_chapter and info['book_id'] == book_id and info['chapter'] == chapter:
+                    continue
+                info['score'] = score
+                results.append(info)
+            if len(results) >= top_k:
+                break
+
+    else:  # sqlite
+        load_sqlite_vec(conn)
+
+        query_vec = _get_verse_dense(conn, verse_id, use_context)
+        if query_vec is None:
+            conn.close()
+            return []
+
+        candidates = _dense_knn_verse(conn, query_vec, top_k * 3, bible_id, use_context)
+        q_sparse = _load_sparse(conn, verse_id, use_context)
+        q_colbert = _load_colbert(conn, verse_id, use_context)
+        scored = _hybrid_rescore(conn, candidates, q_sparse, q_colbert, use_context=use_context)
+
+        results = []
+        for vid, score, d, s, c in scored:
+            if vid == verse_id:
+                continue
+            info = _verse_info(conn, vid)
+            if info:
+                if exclude_same_chapter and info['book_id'] == book_id and info['chapter'] == chapter:
+                    continue
+                info['score'] = score
+                info['scores'] = {'dense': d, 'sparse': s, 'colbert': c}
+                results.append(info)
+            if len(results) >= top_k:
+                break
 
     conn.close()
     return results
 
 
-def search_meaning(text, top_k=20, bible_id=None, use_context=True):
+def search_meaning(text, top_k=20, bible_id=None, use_context=True, backend='qdrant'):
     """Search for verses by meaning using free text query.
 
     Encodes query with BGE-M3, then hybrid-scores candidates.
     Set use_context=False to search against context-free embeddings.
+    Set backend='qdrant' to use Qdrant server.
     """
     if bible_id is None:
         bible_id = default_bible_id()
 
     q_dense, q_sparse, q_colbert = encode_query(text)
 
-    conn = get_conn()
-    load_sqlite_vec(conn)
+    if backend == 'qdrant':
+        scored = _qdrant_hybrid_verse(q_dense, q_sparse, q_colbert, top_k, bible_id, use_context)
 
-    candidates = _dense_knn_verse(conn, q_dense, top_k * 5, bible_id, use_context)
-    scored = _hybrid_rescore(conn, candidates, q_sparse, q_colbert, use_context=use_context)
+        conn = get_conn()
+        results = []
+        for vid, score in scored:
+            info = _verse_info(conn, vid)
+            if info:
+                info['score'] = score
+                results.append(info)
+            if len(results) >= top_k:
+                break
+        conn.close()
+        return results
 
-    results = []
-    for vid, score, d, s, c in scored:
-        info = _verse_info(conn, vid)
-        if info:
-            info['score'] = score
-            info['scores'] = {'dense': d, 'sparse': s, 'colbert': c}
-            results.append(info)
-        if len(results) >= top_k:
-            break
+    else:  # sqlite
+        conn = get_conn()
+        load_sqlite_vec(conn)
 
-    conn.close()
-    return results
+        candidates = _dense_knn_verse(conn, q_dense, top_k * 5, bible_id, use_context)
+        scored = _hybrid_rescore(conn, candidates, q_sparse, q_colbert, use_context=use_context)
+
+        results = []
+        for vid, score, d, s, c in scored:
+            info = _verse_info(conn, vid)
+            if info:
+                info['score'] = score
+                info['scores'] = {'dense': d, 'sparse': s, 'colbert': c}
+                results.append(info)
+            if len(results) >= top_k:
+                break
+
+        conn.close()
+        return results
 
 
-def find_similar_chapters(book, chapter, top_k=10, bible_id=None):
+def find_similar_chapters(book, chapter, top_k=10, bible_id=None, backend='qdrant'):
     """Find chapters similar to a given chapter using dense vectors."""
     if bible_id is None:
         bible_id = default_bible_id()
 
     conn = get_conn()
-    load_sqlite_vec(conn)
 
     book_id, _ = resolve_book(conn, book)
     if book_id is None:
@@ -410,54 +612,89 @@ def find_similar_chapters(book, chapter, top_k=10, bible_id=None):
         return []
     chapter_id = row[0]
 
-    # Get chapter embedding
-    row = conn.execute(
-        "SELECT embedding FROM chapter_vec WHERE chapter_id=?", (chapter_id,)
-    ).fetchone()
-    if not row:
-        conn.close()
-        return []
-    query_vec = np.frombuffer(row[0], dtype=np.float32)
+    if backend == 'qdrant':
+        # Get chapter embedding from Qdrant
+        client = _get_qdrant()
+        point_data = client.retrieve('chapters', ids=[chapter_id], with_vectors=True)
+        if not point_data:
+            conn.close()
+            return []
+        query_vec = np.array(point_data[0].vector, dtype=np.float32)
 
-    # KNN
-    candidates = _dense_knn_chapter(conn, query_vec, top_k + 1)
+        candidates = _qdrant_dense_chapter(query_vec, top_k + 1)
 
-    results = []
-    for ch_id, dist in candidates:
-        if ch_id == chapter_id:
-            continue
-        info = _chapter_info(conn, ch_id)
-        if info:
-            info['similarity'] = 1.0 - dist
-            results.append(info)
-        if len(results) >= top_k:
-            break
+        results = []
+        for ch_id, score in candidates:
+            if ch_id == chapter_id:
+                continue
+            info = _chapter_info(conn, ch_id)
+            if info:
+                info['similarity'] = score
+                results.append(info)
+            if len(results) >= top_k:
+                break
+
+    else:  # sqlite
+        load_sqlite_vec(conn)
+
+        row = conn.execute(
+            "SELECT embedding FROM chapter_vec WHERE chapter_id=?", (chapter_id,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return []
+        query_vec = np.frombuffer(row[0], dtype=np.float32)
+
+        candidates = _dense_knn_chapter(conn, query_vec, top_k + 1)
+
+        results = []
+        for ch_id, dist in candidates:
+            if ch_id == chapter_id:
+                continue
+            info = _chapter_info(conn, ch_id)
+            if info:
+                info['similarity'] = 1.0 - dist
+                results.append(info)
+            if len(results) >= top_k:
+                break
 
     conn.close()
     return results
 
 
-def search_chapters(text, top_k=10):
+def search_chapters(text, top_k=10, backend='qdrant'):
     """Search for chapters by meaning using free text query."""
     q_dense, _, _ = encode_query(text)
 
     conn = get_conn()
-    load_sqlite_vec(conn)
 
-    candidates = _dense_knn_chapter(conn, q_dense, top_k)
+    if backend == 'qdrant':
+        candidates = _qdrant_dense_chapter(q_dense, top_k)
 
-    results = []
-    for ch_id, dist in candidates:
-        info = _chapter_info(conn, ch_id)
-        if info:
-            info['similarity'] = 1.0 - dist
-            results.append(info)
+        results = []
+        for ch_id, score in candidates:
+            info = _chapter_info(conn, ch_id)
+            if info:
+                info['similarity'] = score
+                results.append(info)
+
+    else:  # sqlite
+        load_sqlite_vec(conn)
+
+        candidates = _dense_knn_chapter(conn, q_dense, top_k)
+
+        results = []
+        for ch_id, dist in candidates:
+            info = _chapter_info(conn, ch_id)
+            if info:
+                info['similarity'] = 1.0 - dist
+                results.append(info)
 
     conn.close()
     return results
 
 
-def hierarchical_search(text, top_chapters=5, top_verses=10, bible_id=None, use_context=True):
+def hierarchical_search(text, top_chapters=5, top_verses=10, bible_id=None, use_context=True, backend='qdrant'):
     """Two-stage search: find top chapters, then top verses within them."""
     if bible_id is None:
         bible_id = default_bible_id()
@@ -465,58 +702,94 @@ def hierarchical_search(text, top_chapters=5, top_verses=10, bible_id=None, use_
     q_dense, q_sparse, q_colbert = encode_query(text)
 
     conn = get_conn()
-    load_sqlite_vec(conn)
 
-    # Stage 1: chapter-level (always uses context-aware chapter_vec)
-    ch_candidates = _dense_knn_chapter(conn, q_dense, top_chapters)
+    if backend == 'qdrant':
+        ch_candidates = _qdrant_dense_chapter(q_dense, top_chapters)
 
-    results = []
-    for ch_id, ch_dist in ch_candidates:
-        ch_info = _chapter_info(conn, ch_id)
-        if not ch_info:
-            continue
-        ch_info['similarity'] = 1.0 - ch_dist
-
-        # Stage 2: get verses in this chapter
-        verse_ids = conn.execute("""
-            SELECT id FROM verse
-            WHERE chapter_id=? AND bible_id=?
-            ORDER BY verse_number
-        """, (ch_id, bible_id)).fetchall()
-
-        # Score each verse
-        verse_scores = []
-        for (vid,) in verse_ids:
-            d_vec = _get_verse_dense(conn, vid, use_context)
-            if d_vec is None:
+        results = []
+        for ch_id, ch_score in ch_candidates:
+            ch_info = _chapter_info(conn, ch_id)
+            if not ch_info:
                 continue
-            # Cosine similarity (both L2-normalized)
-            sim = float(np.dot(q_dense, d_vec))
-            verse_scores.append((vid, sim))
+            ch_info['similarity'] = ch_score
 
-        verse_scores.sort(key=lambda x: x[1], reverse=True)
+            # Get verses in this chapter
+            verse_ids = conn.execute("""
+                SELECT id FROM verse
+                WHERE chapter_id=? AND bible_id=?
+                ORDER BY verse_number
+            """, (ch_id, bible_id)).fetchall()
 
-        # Top verses in this chapter
-        ch_verses = []
-        for vid, sim in verse_scores[:top_verses]:
-            info = _verse_info(conn, vid)
-            if info:
-                info['score'] = sim
-                ch_verses.append(info)
+            # Score each verse via Qdrant dense
+            verse_scores = []
+            for (vid,) in verse_ids:
+                d_vec = _qdrant_get_verse_dense(vid, use_context)
+                if d_vec is None:
+                    continue
+                sim = float(np.dot(q_dense, d_vec))
+                verse_scores.append((vid, sim))
 
-        ch_info['verses'] = ch_verses
-        results.append(ch_info)
+            verse_scores.sort(key=lambda x: x[1], reverse=True)
+
+            ch_verses = []
+            for vid, sim in verse_scores[:top_verses]:
+                info = _verse_info(conn, vid)
+                if info:
+                    info['score'] = sim
+                    ch_verses.append(info)
+
+            ch_info['verses'] = ch_verses
+            results.append(ch_info)
+
+    else:  # sqlite
+        load_sqlite_vec(conn)
+
+        ch_candidates = _dense_knn_chapter(conn, q_dense, top_chapters)
+
+        results = []
+        for ch_id, ch_dist in ch_candidates:
+            ch_info = _chapter_info(conn, ch_id)
+            if not ch_info:
+                continue
+            ch_info['similarity'] = 1.0 - ch_dist
+
+            verse_ids = conn.execute("""
+                SELECT id FROM verse
+                WHERE chapter_id=? AND bible_id=?
+                ORDER BY verse_number
+            """, (ch_id, bible_id)).fetchall()
+
+            verse_scores = []
+            for (vid,) in verse_ids:
+                d_vec = _get_verse_dense(conn, vid, use_context)
+                if d_vec is None:
+                    continue
+                sim = float(np.dot(q_dense, d_vec))
+                verse_scores.append((vid, sim))
+
+            verse_scores.sort(key=lambda x: x[1], reverse=True)
+
+            ch_verses = []
+            for vid, sim in verse_scores[:top_verses]:
+                info = _verse_info(conn, vid)
+                if info:
+                    info['score'] = sim
+                    ch_verses.append(info)
+
+            ch_info['verses'] = ch_verses
+            results.append(ch_info)
 
     conn.close()
     return results
 
 
-def discover_crossrefs(book, chapter, verse, top_k=50, bible_id=None, exclude_same_chapter=False, use_context=True):
+def discover_crossrefs(book, chapter, verse, top_k=50, bible_id=None, exclude_same_chapter=False, use_context=True, backend='qdrant'):
     """Find semantically similar verses that are NOT in existing cross-references.
 
     Returns novel connections that could be new cross-references.
     Set use_context=False for better verse-to-verse matching.
     Set exclude_same_chapter=True to filter out verses from the same chapter.
+    Set backend='qdrant' to use Qdrant server.
     """
     if bible_id is None:
         bible_id = default_bible_id()
@@ -524,7 +797,7 @@ def discover_crossrefs(book, chapter, verse, top_k=50, bible_id=None, exclude_sa
     # Get all similar verses
     similar = find_similar(book, chapter, verse, top_k=top_k, bible_id=bible_id,
                            exclude_same_chapter=exclude_same_chapter,
-                           use_context=use_context)
+                           use_context=use_context, backend=backend)
     if not similar:
         return []
 
@@ -567,7 +840,7 @@ def discover_crossrefs(book, chapter, verse, top_k=50, bible_id=None, exclude_sa
     return novel
 
 
-def evaluate_quality(sample_size=500, bible_id=None, use_context=True):
+def evaluate_quality(sample_size=500, bible_id=None, use_context=True, backend='qdrant'):
     """Evaluate embedding quality against high-vote cross-references.
 
     Samples verses that have high-vote (>100) cross-references and measures
@@ -579,7 +852,8 @@ def evaluate_quality(sample_size=500, bible_id=None, use_context=True):
         bible_id = default_bible_id()
 
     conn = get_conn()
-    load_sqlite_vec(conn)
+    if backend == 'sqlite':
+        load_sqlite_vec(conn)
 
     # Find verses with high-vote cross-refs
     rows = conn.execute("""
@@ -611,7 +885,10 @@ def evaluate_quality(sample_size=500, bible_id=None, use_context=True):
         src_vid = src_row[0]
 
         # Get dense embedding
-        q_vec = _get_verse_dense(conn, src_vid, use_context)
+        if backend == 'qdrant':
+            q_vec = _qdrant_get_verse_dense(src_vid, use_context)
+        else:
+            q_vec = _get_verse_dense(conn, src_vid, use_context)
         if q_vec is None:
             continue
 
@@ -631,14 +908,18 @@ def evaluate_quality(sample_size=500, bible_id=None, use_context=True):
             continue
 
         # Dense KNN
-        candidates = _dense_knn_verse(conn, q_vec, 55, bible_id, use_context)
+        if backend == 'qdrant':
+            candidates = _qdrant_dense_verse(q_vec, 55, bible_id, use_context)
+        else:
+            candidates = _dense_knn_verse(conn, q_vec, 55, bible_id, use_context)
 
         # Map candidates to addresses
         found_at_10 = 0
         found_at_50 = 0
         first_rank = None
 
-        for rank, (vid, _) in enumerate(candidates):
+        for rank, item in enumerate(candidates):
+            vid = item[0]
             if vid == src_vid:
                 continue
             info = conn.execute(
@@ -708,79 +989,98 @@ if __name__ == '__main__':
     print("  Semantic Search Demo — BGE-M3 Hybrid")
     print("=" * 60)
 
-    # Check embeddings exist
+    # Detect available backends
+    backends = []
+
     conn = get_conn()
     has_vec = load_sqlite_vec(conn)
-    if not has_vec:
-        print("\nError: sqlite-vec extension not available.")
-        print("Install: pip install sqlite-vec")
-        sys.exit(1)
-
-    # Check if verse_vec has data
-    try:
-        ctx_count = conn.execute("SELECT COUNT(*) FROM verse_vec").fetchone()[0]
-    except Exception:
-        ctx_count = 0
-    try:
-        noctx_count = conn.execute("SELECT COUNT(*) FROM verse_vec_noctx").fetchone()[0]
-    except Exception:
-        noctx_count = 0
-
-    if ctx_count == 0 and noctx_count == 0:
-        print("\nNo embeddings found. Run embed_verses.py first:")
-        print("  python scripts/embed_verses.py")
-        conn.close()
-        sys.exit(1)
-
-    print(f"\n  Context-aware:  {ctx_count} verse embeddings")
-    print(f"  Context-free:   {noctx_count} verse embeddings\n")
-    has_noctx = noctx_count > 0
+    if has_vec:
+        try:
+            ctx_count = conn.execute("SELECT COUNT(*) FROM verse_vec").fetchone()[0]
+        except Exception:
+            ctx_count = 0
+        try:
+            noctx_count = conn.execute("SELECT COUNT(*) FROM verse_vec_noctx").fetchone()[0]
+        except Exception:
+            noctx_count = 0
+        if ctx_count > 0 or noctx_count > 0:
+            backends.append('sqlite')
+            print(f"\n  [sqlite] Context-aware: {ctx_count}, Context-free: {noctx_count}")
     conn.close()
 
-    # 1. Find similar verses (context-aware)
-    print("\n1. find_similar('Gen', 1, 1, use_context=True)")
-    results = find_similar('Gen', 1, 1, top_k=10, use_context=True)
-    _print_verse_results(results, "Genesis 1:1 — context-aware (late-chunked)")
+    has_qdrant = _qdrant_available()
+    if has_qdrant:
+        qc = _get_qdrant()
+        try:
+            q_ctx = qc.get_collection('verses_ctx').points_count
+        except Exception:
+            q_ctx = 0
+        try:
+            q_noctx = qc.get_collection('verses_noctx').points_count
+        except Exception:
+            q_noctx = 0
+        if q_ctx > 0 or q_noctx > 0:
+            backends.append('qdrant')
+            print(f"  [qdrant] Context-aware: {q_ctx}, Context-free: {q_noctx}")
 
-    # 2. Find similar verses (context-free) — compare
-    if has_noctx:
-        print("\n2. find_similar('Gen', 1, 1, use_context=False)")
-        results = find_similar('Gen', 1, 1, top_k=10, use_context=False)
-        _print_verse_results(results, "Genesis 1:1 — context-free (independent)")
+    if not backends:
+        print("\nNo embeddings found in any backend. Run embed_verses.py first:")
+        print("  python scripts/embed_verses.py --backend sqlite")
+        print("  python scripts/embed_verses.py --backend qdrant")
+        sys.exit(1)
 
-    # 3. Semantic search
-    print("\n3. search_meaning('el amor de Dios')")
-    results = search_meaning('el amor de Dios', top_k=10)
-    _print_verse_results(results, "Search: 'el amor de Dios'")
+    # Run demos for each available backend
+    for be in backends:
+        print(f"\n{'='*60}")
+        print(f"  Backend: {be}")
+        print(f"{'='*60}")
 
-    # 4. Similar chapters
-    print("\n4. find_similar_chapters('Gen', 1)")
-    results = find_similar_chapters('Gen', 1, top_k=5)
-    _print_chapter_results(results, "Chapters similar to Genesis 1")
+        # 1. Find similar verses (context-aware)
+        print(f"\n1. find_similar('Gen', 1, 1, use_context=True, backend='{be}')")
+        results = find_similar('Gen', 1, 1, top_k=10, use_context=True, backend=be)
+        _print_verse_results(results, f"Genesis 1:1 — context-aware [{be}]")
 
-    # 5. Discover cross-refs (context-free, exclude same chapter)
-    if has_noctx:
-        print("\n5. discover_crossrefs('Gen', 1, 1, use_context=False, exclude_same_chapter=True)")
-        results = discover_crossrefs('Gen', 1, 1, top_k=20, use_context=False, exclude_same_chapter=True)
-        _print_verse_results(results[:15], "Cross-ref discovery — context-free, cross-chapter", show_novel=True)
+        # 2. Find similar verses (context-free)
+        print(f"\n2. find_similar('Gen', 1, 1, use_context=False, backend='{be}')")
+        results = find_similar('Gen', 1, 1, top_k=10, use_context=False, backend=be)
+        _print_verse_results(results, f"Genesis 1:1 — context-free [{be}]")
+
+        # 3. Semantic search
+        print(f"\n3. search_meaning('el amor de Dios', backend='{be}')")
+        results = search_meaning('el amor de Dios', top_k=10, backend=be)
+        _print_verse_results(results, f"Search: 'el amor de Dios' [{be}]")
+
+        # 4. Similar chapters
+        print(f"\n4. find_similar_chapters('Gen', 1, backend='{be}')")
+        results = find_similar_chapters('Gen', 1, top_k=5, backend=be)
+        _print_chapter_results(results, f"Chapters similar to Genesis 1 [{be}]")
+
+        # 5. Discover cross-refs
+        print(f"\n5. discover_crossrefs('Gen', 1, 1, use_context=False, backend='{be}')")
+        results = discover_crossrefs('Gen', 1, 1, top_k=20, use_context=False,
+                                     exclude_same_chapter=True, backend=be)
+        _print_verse_results(results[:15],
+                             f"Cross-ref discovery — context-free [{be}]",
+                             show_novel=True)
         novel_count = sum(1 for r in results if r.get('is_novel'))
         print(f"\n  Novel connections: {novel_count}/{len(results)}")
 
-    # 6. Evaluate quality — compare both modes
-    print("\n6. Evaluation comparison")
-    for mode_name, use_ctx in [("context-aware", True), ("context-free", False)]:
-        if not use_ctx and not has_noctx:
-            continue
-        t0 = time.time()
-        metrics = evaluate_quality(sample_size=200, use_context=use_ctx)
-        elapsed = time.time() - t0
-        if metrics:
-            print(f"\n{'─'*60}")
-            print(f"  {mode_name} ({metrics['evaluated']} verses, {elapsed:.1f}s)")
-            print(f"{'─'*60}")
-            print(f"  Recall@10:  {metrics['recall@10']:.3f}")
-            print(f"  Recall@50:  {metrics['recall@50']:.3f}")
-            print(f"  MRR:        {metrics['MRR']:.3f}")
+    # 6. Evaluate quality — compare backends and modes
+    print(f"\n{'='*60}")
+    print("  Quality Evaluation")
+    print(f"{'='*60}")
+    for be in backends:
+        for mode_name, use_ctx in [("context-aware", True), ("context-free", False)]:
+            t0 = time.time()
+            metrics = evaluate_quality(sample_size=200, use_context=use_ctx, backend=be)
+            elapsed = time.time() - t0
+            if metrics:
+                print(f"\n{'─'*60}")
+                print(f"  {mode_name} [{be}] ({metrics['evaluated']} verses, {elapsed:.1f}s)")
+                print(f"{'─'*60}")
+                print(f"  Recall@10:  {metrics['recall@10']:.3f}")
+                print(f"  Recall@50:  {metrics['recall@50']:.3f}")
+                print(f"  MRR:        {metrics['MRR']:.3f}")
 
     print(f"\n{'='*60}")
     print("  Demo complete.")
