@@ -23,7 +23,7 @@ python scripts/embed_verses.py       # Optional: embeddings (requires GPU)
 
 ## Schema
 
-24 tables in [`db/schema.sql`](db/schema.sql), plus optional embedding storage:
+24 tables in [`db/schema.sql`](db/schema.sql) (simplified diagram below — see schema file for full DDL), plus optional embedding storage:
 
 ```
 testament ─1:N─ book ─1:N─ chapter ─1:N─ verse ─N:1─ bible
@@ -40,8 +40,8 @@ testament ─1:N─ book ─1:N─ chapter ─1:N─ verse ─N:1─ bible
 
 | Backend | Tables / Collections | Notes |
 |---------|---------------------|-------|
-| **sqlite-vec** (default) | 3 virtual tables (`verse_vec`, `chapter_vec`, `verse_vec_noctx`) + 4 regular tables | In-process, no server needed |
-| **Qdrant** (optional) | 3 collections (`verses_ctx`, `verses_noctx`, `chapters`) | Docker server, HNSW indexes, on-disk vectors |
+| **Qdrant** (default) | 3 collections (`verses_ctx`, `verses_noctx`, `chapters`) | Docker server, HNSW indexes, on-disk vectors |
+| **sqlite-vec** (fallback) | 3 virtual tables (`verse_vec`, `chapter_vec`, `verse_vec_noctx`) + 4 regular tables | In-process, no server needed |
 
 Both backends coexist. Use `--backend sqlite|qdrant` to select.
 
@@ -193,13 +193,31 @@ The database uses **LXX/Vulgate numbering** (standard for Catholic Bibles). The 
 
 Cross-references from Protestant datasets are automatically converted to LXX numbering during import.
 
+## Web UI
+
+A Streamlit app for browsing, searching, and exploring the Bible database interactively.
+
+```bash
+pip install -r requirements-app.txt
+streamlit run app.py
+```
+
+Three tabs:
+- **Leer** — Browse chapters with a collapsible book tree. Toggle inline annotation badges.
+- **Busqueda** — Keyword search (FTS5) or semantic meaning search (BGE-M3). Results grouped by book.
+- **Versiculo** — Explore a specific verse: similar verses (verse-to-verse + contextual), footnotes, cross-references, commentary. Click any result to chain-explore.
+
+The reader and search tabs work without embeddings. Semantic features require `requirements-embeddings.txt` and a running Qdrant (or sqlite-vec fallback).
+
 ## Project Structure
 
 ```
 bible/
+├── app.py                        # Streamlit web UI
 ├── bible.db                      # Built locally (gitignored)
 ├── db/
 │   └── schema.sql                # Full DDL (24 tables)
+├── requirements-app.txt          # Streamlit dependency
 ├── requirements-embeddings.txt   # Optional deps for semantic search
 └── scripts/
     ├── create_db.py              # Schema + seed reference data
@@ -225,3 +243,4 @@ bible/
 - No external Python dependencies (except `pysword` for SWORD imports)
 - Optional: `pip install -r requirements-embeddings.txt` for semantic search (GPU recommended)
 - Optional: Docker for Qdrant backend (`docker run -d --name qdrant -p 6333:6333 qdrant/qdrant:latest`)
+- Set `QDRANT_URL` environment variable to override the default Qdrant address (`http://localhost:6333`)

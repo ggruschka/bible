@@ -29,7 +29,7 @@ Cross-references, footnotes, and section headings all use `(book_id, chapter, ve
 - 344,795 cross-references from OpenBible.info
 - FTS5 full-text search working
 - BGE-M3 dual-mode embeddings: context-aware (late chunking) + context-free (independent)
-- Dual backend: sqlite-vec (default) + Qdrant server (optional, requires Docker)
+- Dual backend: Qdrant server (default) + sqlite-vec (fallback, requires --backend sqlite)
 - Semantic search with hybrid scoring (dense + sparse → RRF fusion → ColBERT rescore)
 - No footnotes, commentaries, or section headings imported yet
 - PDF extraction approach for v28 still TBD

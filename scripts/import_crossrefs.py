@@ -60,10 +60,13 @@ def parse_osis_ref(ref):
     parts = ref.split('.')
     if len(parts) != 3:
         return None
-    return parts[0], int(parts[1]), int(parts[2])
+    try:
+        return parts[0], int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
 
 
-def hebrew_to_lxx_psalm(hebrew_num):
+def hebrew_to_lxx_psalm(hebrew_num, verse=None):
     """Convert Hebrew psalm numbering to LXX (Straubinger) numbering.
 
     Hebrew → LXX mapping:
@@ -87,11 +90,15 @@ def hebrew_to_lxx_psalm(hebrew_num):
     elif hebrew_num <= 115:
         return 113  # 114-115 → 113
     elif hebrew_num == 116:
-        return 114  # simplified — 116 maps to 114/115
+        if verse is not None and verse >= 10:
+            return 115
+        return 114
     elif hebrew_num <= 146:
         return hebrew_num - 1  # 117→116, ..., 146→145
     elif hebrew_num == 147:
-        return 146  # simplified — 147 maps to 146/147
+        if verse is not None and verse >= 12:
+            return 147
+        return 146
     else:
         return hebrew_num  # 148-150 same
 
@@ -155,7 +162,10 @@ def import_crossrefs():
 
             source_ref = parts[0].strip()
             target_ref = parts[1].strip()
-            votes = int(parts[2]) if len(parts) > 2 else None
+            try:
+                votes = int(parts[2]) if len(parts) > 2 else None
+            except ValueError:
+                votes = None
 
             # Parse source
             src = parse_osis_ref(source_ref)
@@ -179,9 +189,9 @@ def import_crossrefs():
 
             # Convert psalm numbering (Hebrew → LXX)
             if src_book_id == psalm_book_id:
-                src_ch = psalm_map.get(src_ch, hebrew_to_lxx_psalm(src_ch))
+                src_ch = psalm_map.get(src_ch, hebrew_to_lxx_psalm(src_ch, src_v))
             if tgt_book_id == psalm_book_id:
-                tgt_ch = psalm_map.get(tgt_ch, hebrew_to_lxx_psalm(tgt_ch))
+                tgt_ch = psalm_map.get(tgt_ch, hebrew_to_lxx_psalm(tgt_ch, tgt_v))
 
             # Insert
             try:

@@ -114,10 +114,6 @@ BOOKS = [
     (78, 2, 'Laodicenses', 'Laodiceans', 'Lao', 'EpLao', 'laodicenses', 'EpLao', 1, 'appendix', None),
 ]
 
-# Additional OSIS IDs used by Protestant Bibles (not in Catholic canon)
-# These map to book_id=NULL so cross-ref import can skip them gracefully
-PROTESTANT_ONLY_OSIS = []  # All 66 Protestant books are in the Catholic 73
-
 # ─── Psalm numbering: LXX (Straubinger) ↔ Hebrew (Protestant) ───
 # Format: (lxx_number, hebrew_number, lxx_display)
 # Used to convert OpenBible.info Hebrew refs to our LXX numbering

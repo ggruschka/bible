@@ -163,7 +163,9 @@ def validate():
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
         has_vec = True
-    except (ImportError, Exception):
+    except ImportError:
+        pass
+    except Exception:
         pass
 
     if not has_vec:

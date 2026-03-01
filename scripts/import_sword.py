@@ -115,7 +115,7 @@ def import_sword():
                             verses=verse_num,
                             clean=True
                         )
-                    except Exception:
+                    except (KeyError, IndexError, TypeError):
                         text = None
 
                     if not text or not text.strip():

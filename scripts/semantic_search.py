@@ -24,6 +24,7 @@ import json
 import os
 import struct
 import sys
+import threading
 import time
 
 import numpy as np
@@ -68,22 +69,28 @@ def load_sqlite_vec(conn):
         sqlite_vec.load(conn)
         conn.enable_load_extension(False)
         return True
-    except (ImportError, Exception) as e:
+    except ImportError as e:
         print(f"Warning: sqlite-vec not available: {e}")
+        return False
+    except Exception as e:
+        print(f"Warning: sqlite-vec failed to load: {e}")
         return False
 
 
 # ─── Qdrant helpers ───
 
 _qdrant_client = None
+_qdrant_lock = threading.Lock()
 
 
 def _get_qdrant():
-    """Get or create Qdrant client (cached)."""
+    """Get or create Qdrant client (cached, thread-safe)."""
     global _qdrant_client
     if _qdrant_client is None:
-        from qdrant_client import QdrantClient
-        _qdrant_client = QdrantClient(url=QDRANT_URL)
+        with _qdrant_lock:
+            if _qdrant_client is None:
+                from qdrant_client import QdrantClient
+                _qdrant_client = QdrantClient(url=QDRANT_URL)
     return _qdrant_client
 
 
@@ -100,18 +107,21 @@ def _qdrant_available():
 # ─── Lazy Model Loading ───
 
 _model_cache = None
+_model_lock = threading.Lock()
 
 
 def _get_model():
-    """Lazily load BGE-M3 for query encoding."""
+    """Lazily load BGE-M3 for query encoding (thread-safe)."""
     global _model_cache
     if _model_cache is None:
-        from FlagEmbedding import BGEM3FlagModel
-        import torch
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        use_fp16 = device == 'cuda'
-        print(f"Loading BGE-M3 for query encoding ({device})...")
-        _model_cache = BGEM3FlagModel('BAAI/bge-m3', use_fp16=use_fp16, devices=[device])
+        with _model_lock:
+            if _model_cache is None:
+                from FlagEmbedding import BGEM3FlagModel
+                import torch
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                use_fp16 = device == 'cuda'
+                print(f"Loading BGE-M3 for query encoding ({device})...")
+                _model_cache = BGEM3FlagModel('BAAI/bge-m3', use_fp16=use_fp16, devices=[device])
     return _model_cache
 
 
@@ -491,7 +501,10 @@ def find_similar(book, chapter, verse, top_k=20, bible_id=None, exclude_same_cha
         sparse_point = client.retrieve(collection, ids=[verse_id], with_vectors=["sparse"])
         if sparse_point and sparse_point[0].vector.get("sparse"):
             sv = sparse_point[0].vector["sparse"]
-            q_sparse = {str(idx): val for idx, val in zip(sv.indices, sv.values)}
+            if hasattr(sv, 'indices') and hasattr(sv, 'values'):
+                q_sparse = {str(idx): val for idx, val in zip(sv.indices, sv.values)}
+            else:
+                q_sparse = {}
         else:
             q_sparse = {}
 

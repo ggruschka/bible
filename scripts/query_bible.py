@@ -24,13 +24,15 @@ def default_bible_id():
     global _default_bid
     if _default_bid is None:
         conn = get_conn()
-        row = conn.execute(
-            "SELECT bible_id FROM verse GROUP BY bible_id ORDER BY COUNT(*) DESC LIMIT 1"
-        ).fetchone()
-        if row is None:
-            row = conn.execute("SELECT id FROM bible ORDER BY id LIMIT 1").fetchone()
-        conn.close()
-        _default_bid = row[0] if row else 1
+        try:
+            row = conn.execute(
+                "SELECT bible_id FROM verse GROUP BY bible_id ORDER BY COUNT(*) DESC LIMIT 1"
+            ).fetchone()
+            if row is None:
+                row = conn.execute("SELECT id FROM bible ORDER BY id LIMIT 1").fetchone()
+            _default_bid = row[0] if row else 1
+        finally:
+            conn.close()
     return _default_bid
 
 
@@ -75,24 +77,25 @@ def get_verse(book, chapter, verse, bible_id=None):
     if bible_id is None:
         bible_id = default_bible_id()
     conn = get_conn()
-    book_id, _ = resolve_book(conn, book)
-    if book_id is None:
-        conn.close()
+    try:
+        book_id, _ = resolve_book(conn, book)
+        if book_id is None:
+            return None
+        row = conn.execute('''
+            SELECT v.text_clean, b.name_es, v.chapter_number, v.verse_number
+            FROM verse v
+            JOIN book b ON v.book_id = b.id
+            WHERE v.book_id = ? AND v.chapter_number = ? AND v.verse_number = ?
+                  AND v.bible_id = ?
+        ''', (book_id, chapter, verse, bible_id)).fetchone()
+        if row:
+            return {
+                'text': row[0],
+                'book': row[1], 'chapter': row[2], 'verse': row[3]
+            }
         return None
-    row = conn.execute('''
-        SELECT v.text_clean, b.name_es, v.chapter_number, v.verse_number
-        FROM verse v
-        JOIN book b ON v.book_id = b.id
-        WHERE v.book_id = ? AND v.chapter_number = ? AND v.verse_number = ?
-              AND v.bible_id = ?
-    ''', (book_id, chapter, verse, bible_id)).fetchone()
-    conn.close()
-    if row:
-        return {
-            'text': row[0],
-            'book': row[1], 'chapter': row[2], 'verse': row[3]
-        }
-    return None
+    finally:
+        conn.close()
 
 
 def get_chapter(book, chapter, bible_id=None):
@@ -100,18 +103,19 @@ def get_chapter(book, chapter, bible_id=None):
     if bible_id is None:
         bible_id = default_bible_id()
     conn = get_conn()
-    book_id, book_name = resolve_book(conn, book)
-    if book_id is None:
+    try:
+        book_id, book_name = resolve_book(conn, book)
+        if book_id is None:
+            return []
+        rows = conn.execute('''
+            SELECT v.verse_number, v.text_clean
+            FROM verse v
+            WHERE v.book_id = ? AND v.chapter_number = ? AND v.bible_id = ?
+            ORDER BY v.verse_number
+        ''', (book_id, chapter, bible_id)).fetchall()
+        return [{'verse': r[0], 'text': r[1], 'book': book_name} for r in rows]
+    finally:
         conn.close()
-        return []
-    rows = conn.execute('''
-        SELECT v.verse_number, v.text_clean
-        FROM verse v
-        WHERE v.book_id = ? AND v.chapter_number = ? AND v.bible_id = ?
-        ORDER BY v.verse_number
-    ''', (book_id, chapter, bible_id)).fetchall()
-    conn.close()
-    return [{'verse': r[0], 'text': r[1], 'book': book_name} for r in rows]
 
 
 def search_text(query, bible_id=None, limit=20):
@@ -119,71 +123,75 @@ def search_text(query, bible_id=None, limit=20):
     if bible_id is None:
         bible_id = default_bible_id()
     conn = get_conn()
-    rows = conn.execute('''
-        SELECT b.abbrev_es, f.chapter_number, f.verse_number,
-               snippet(verse_fts, 0, '>>>', '<<<', '...', 30)
-        FROM verse_fts f
-        JOIN book b ON f.book_id = b.id
-        WHERE text_clean MATCH ? AND f.bible_id = ?
-        LIMIT ?
-    ''', (query, bible_id, limit)).fetchall()
-    conn.close()
-    return [{'ref': f'{r[0]} {r[1]}:{r[2]}', 'snippet': r[3]} for r in rows]
+    try:
+        rows = conn.execute('''
+            SELECT b.abbrev_es, f.chapter_number, f.verse_number,
+                   snippet(verse_fts, 0, '>>>', '<<<', '...', 30)
+            FROM verse_fts f
+            JOIN book b ON f.book_id = b.id
+            WHERE text_clean MATCH ? AND f.bible_id = ?
+            LIMIT ?
+        ''', (query, bible_id, limit)).fetchall()
+        return [{'ref': f'{r[0]} {r[1]}:{r[2]}', 'snippet': r[3]} for r in rows]
+    finally:
+        conn.close()
 
 
 def get_footnotes(book, chapter, verse):
     """Get all footnotes for a specific verse (shared across all Bibles)."""
     conn = get_conn()
-    book_id, _ = resolve_book(conn, book)
-    if book_id is None:
+    try:
+        book_id, _ = resolve_book(conn, book)
+        if book_id is None:
+            return []
+        rows = conn.execute('''
+            SELECT fn.id, fn.text
+            FROM footnote fn
+            WHERE fn.book_id = ? AND fn.chapter_number = ?
+                  AND fn.verse_start <= ? AND (fn.verse_end >= ? OR fn.verse_end IS NULL AND fn.verse_start = ?)
+            ORDER BY fn.verse_start, fn.id
+        ''', (book_id, chapter, verse, verse, verse)).fetchall()
+        return [{'id': r[0], 'text': r[1]} for r in rows]
+    finally:
         conn.close()
-        return []
-    rows = conn.execute('''
-        SELECT fn.id, fn.text
-        FROM footnote fn
-        WHERE fn.book_id = ? AND fn.chapter_number = ?
-              AND fn.verse_start <= ? AND (fn.verse_end >= ? OR fn.verse_end IS NULL AND fn.verse_start = ?)
-        ORDER BY fn.verse_start, fn.id
-    ''', (book_id, chapter, verse, verse, verse)).fetchall()
-    conn.close()
-    return [{'id': r[0], 'text': r[1]} for r in rows]
 
 
 def get_cross_refs(book, chapter, verse, limit=20):
     """Get cross-references for a specific verse, ordered by relevance."""
     conn = get_conn()
-    book_id, _ = resolve_book(conn, book)
-    if book_id is None:
+    try:
+        book_id, _ = resolve_book(conn, book)
+        if book_id is None:
+            return []
+        rows = conn.execute('''
+            SELECT b.abbrev_es, cr.target_chapter, cr.target_verse, cr.votes
+            FROM cross_reference cr
+            JOIN book b ON cr.target_book_id = b.id
+            WHERE cr.source_book_id = ? AND cr.source_chapter = ? AND cr.source_verse = ?
+            ORDER BY cr.votes DESC
+            LIMIT ?
+        ''', (book_id, chapter, verse, limit)).fetchall()
+        return [{'ref': f'{r[0]} {r[1]}:{r[2]}', 'votes': r[3]} for r in rows]
+    finally:
         conn.close()
-        return []
-
-    rows = conn.execute('''
-        SELECT b.abbrev_es, cr.target_chapter, cr.target_verse, cr.votes
-        FROM cross_reference cr
-        JOIN book b ON cr.target_book_id = b.id
-        WHERE cr.source_book_id = ? AND cr.source_chapter = ? AND cr.source_verse = ?
-        ORDER BY cr.votes DESC
-        LIMIT ?
-    ''', (book_id, chapter, verse, limit)).fetchall()
-    conn.close()
-    return [{'ref': f'{r[0]} {r[1]}:{r[2]}', 'votes': r[3]} for r in rows]
 
 
 def get_section_headings(book, chapter):
     """Get section headings for a chapter."""
     conn = get_conn()
-    book_id, _ = resolve_book(conn, book)
-    if book_id is None:
+    try:
+        book_id, _ = resolve_book(conn, book)
+        if book_id is None:
+            return []
+        rows = conn.execute('''
+            SELECT sh.before_verse, sh.heading_text, sh.heading_style
+            FROM section_heading sh
+            WHERE sh.book_id = ? AND sh.chapter_number = ?
+            ORDER BY sh.before_verse
+        ''', (book_id, chapter)).fetchall()
+        return [{'before_verse': r[0], 'text': r[1], 'style': r[2]} for r in rows]
+    finally:
         conn.close()
-        return []
-    rows = conn.execute('''
-        SELECT sh.before_verse, sh.heading_text, sh.heading_style
-        FROM section_heading sh
-        WHERE sh.book_id = ? AND sh.chapter_number = ?
-        ORDER BY sh.before_verse
-    ''', (book_id, chapter)).fetchall()
-    conn.close()
-    return [{'before_verse': r[0], 'text': r[1], 'style': r[2]} for r in rows]
 
 
 # ─── CLI Demo ───
